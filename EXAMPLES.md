@@ -2,428 +2,422 @@
 
 ## Overview
 
-Fleet enables you to orchestrate complex multi-node git workflows: stacked features, parallel branches, decision points, and build artifacts. Instead of manually rebasing when bases change, Fleet provides:
+Fleet orchestrates multi-node git workflows: stacked features, decision forks, and build artifacts. Instead of manually rebasing when a base branch changes, Fleet holds the graph and moves everything in one deterministic pass:
 
-- **Cascade:** Automatically rebase all descendants when a base node changes.
-- **Squash Cleanup (Merge-Back):** Drop a node's commits onto main, re-parenting children with a single deterministic operation.
-- **Presentation:** Curate and generate logical commit groupings from technical branches, with PR integration.
-- **Decision Variants:** Fork multiple implementation branches at a decision point; resolve to one and automatically re-parent others.
-- **Status Tracking:** Real-time view of your DAG with node states, blocked nodes, and staleness flags.
+- **Cascade:** Rebase all descendants when a base node changes.
+- **Squash Cleanup (Merge-Back):** Drop a node's commits onto `main`, re-parenting children in a single `git rebase --onto`.
+- **Presentation:** Replay curated logical commits onto `main` for a clean PR.
+- **Decision Variants:** Fork alternative implementations at a decision point; resolve to one and re-parent the rest (experimental).
+- **Status Tracking:** Reconciled view of the DAG with node states and staleness flags.
 
-All destructive operations are gated by dry-run preview and user confirmation. Fleet maintains a manifest (canonical source of truth) and a write-ahead log (WAL) for crash recovery.
+Every destructive operation is gated by a dry-run preview and confirmation. Fleet keeps the graph in a YAML manifest and journals every mutation to a write-ahead log (WAL) for crash recovery.
+
+---
+
+## CLI surface
+
+Fleet exposes eight subcommands. Invoke via `python scripts/fleet.py <command>` (shown below as `fleet` for brevity):
+
+| Command | Args | Purpose |
+|---------|------|---------|
+| `init` | `--feature` | Scaffold the feature directory |
+| `status` | `--feature` `[--json]` | Render the DAG and node states (reconciles first) |
+| `cascade` | `--feature` `--node` `[--dry-run]` | Rebase descendants of a node |
+| `merge` | `--feature` `--node` `[--mode individual\|batch]` `[--dry-run]` | Squash-cleanup a node onto `main` |
+| `publish` | `--feature` `--node` `[--dry-run]` | Build a presentation branch and open/update a PR |
+| `reconcile` | `--feature` `[--json]` | Recompute manifest derivables from git |
+| `classify` | `<utterance>` `[--feature]` `[--json]` | Map a natural-language phrase to an intent |
+| `dryrun` | `--feature` `--intent` `[--nodes ...]` `[--json]` | Preview an operation's impact |
+
+> **Authoring the graph:** `init` currently scaffolds the feature directory only — it does not populate nodes. Seed the node graph by writing `~/.fleet/<feature>/manifest.yaml` directly (schema in [references/MANIFEST-FORMAT.md](./references/MANIFEST-FORMAT.md)). The higher-level `plan` / `materialize` / `work` intents described in [SKILL.md](./SKILL.md) are part of the natural-language spec and are not yet wired as subcommands.
 
 ---
 
 ## Basic Usage
 
-### Initialize a Feature
-
-Initialize Fleet for a new feature effort:
+### 1. Initialize a feature
 
 ```bash
 fleet init --feature payments
 ```
 
-This creates:
-- `~/.fleet/payments/manifest.yaml` (DAG definition)
-- `~/.fleet/payments/.fleet.lock` (operation lock)
-- `~/.fleet/payments/wt/` (worktree pool)
+Scaffolds the feature workspace under `~/.fleet/payments/`. Next, author the graph in the manifest.
 
----
+### 2. Author the manifest
 
-### Plan the DAG
+Write `~/.fleet/payments/manifest.yaml` to define a three-node stack (`a1 → a2 → a3`):
 
-Describe your feature as nodes with dependencies:
+```yaml
+feature: payments
+canonical: main
+merge_mode: individual
+max_worktrees: 6
 
-```bash
-fleet plan --feature payments << 'EOF'
-a1: Database schema migration
-  base: null
-  
-a2: ORM layer
-  base: a1
-  
-a3: API endpoint
-  base: a2
-EOF
+nodes:
+  a1:
+    kind: feature
+    desc: "Database schema migration"
+    base: null              # root node, stacks on main
+    ghost: "ghost/payments/a1"
+    status: draft
+
+  a2:
+    kind: feature
+    desc: "ORM layer"
+    base: a1                # stacked on a1
+    ghost: "ghost/payments/a2"
+    status: draft
+
+  a3:
+    kind: feature
+    desc: "API endpoint"
+    base: a2                # stacked on a2
+    ghost: "ghost/payments/a3"
+    status: draft
 ```
 
-This creates a `FLEET-PLAN.md` proposal. Review and confirm before materializing.
+The `range.base_sha` / `range.tip_sha` fields are derivable — `reconcile` and `status` fill them from live git refs. You do not set them by hand.
 
----
+### 3. Create the ghost branches
 
-### Materialize Branches
-
-Build the ghost branches and worktree pool:
+Fleet reads ghost branch names from the manifest. Create them from `main` with git so the nodes are materialized:
 
 ```bash
-fleet materialize --feature payments
+git branch ghost/payments/a1 main
+git branch ghost/payments/a2 ghost/payments/a1
+git branch ghost/payments/a3 ghost/payments/a2
 ```
 
-Fleet creates:
-- `ghost/payments/a1`, `ghost/payments/a2`, `ghost/payments/a3` (local working branches)
-- Worktrees in `~/.fleet/payments/wt/` (up to 6 by default)
-
----
-
-### Work on a Node
-
-Allocate a worktree and start development:
+### 4. Check status
 
 ```bash
-fleet work --feature payments --node a1
-cd ~/.fleet/payments/wt/wt-1
-# Make commits, run tests...
+fleet status --feature payments
 ```
 
----
+```
+Feature: payments
+Nodes:
+  a1 (feature) [draft]
+    ghost: ghost/payments/a1
+    desc: Database schema migration
+  a2 (feature) [draft]
+    ghost: ghost/payments/a2
+    desc: ORM layer
+  a3 (feature) [draft]
+    ghost: ghost/payments/a3
+    desc: API endpoint
+```
 
-### Cascade Descendants
-
-After committing to `a1`, cascade the changes to all descendants:
+Structured output for tooling:
 
 ```bash
-# Preview impact
+fleet status --feature payments --json
+```
+
+### 5. Cascade descendants
+
+After committing to `ghost/payments/a1`, rebase everything above it. Preview first:
+
+```bash
 fleet cascade --feature payments --node a1 --dry-run
-
-# Execute (requires confirmation)
-fleet cascade --feature payments --node a1
 ```
 
-Output:
 ```
 DRY-RUN: Cascade rebase
   Root node: a1
-  Descendants: a2, a3
+  Descendants to rebase: a2, a3
   Parked worktrees: 1
     - ~/.fleet/payments/wt/wt-2 (ghost/payments/a2)
-  (Conflicts possible if base has conflicting changes)
+  Note: Conflicts possible if base has conflicting changes.
+```
 
-Proceed? (yes/no): yes
+Execute (Fleet reconciles, writes a WAL intent, rebases in topological order, then writes the WAL commit):
+
+```bash
+fleet cascade --feature payments --node a1
+# Cascade a1 and rebase 2 descendants? (yes/no): yes
+```
+
+```
 ✓ Cascade complete
 ```
 
----
+Fleet then prints the machine-readable cascade result (rebased nodes and their new SHAs) as JSON.
 
-### Publish Presentation Branches
+### 6. Publish a presentation branch
 
-Generate a clean, curated presentation branch and open a PR:
+Build a curated branch and open a PR:
 
 ```bash
-# Preview
 fleet publish --feature payments --node a1 --dry-run
-
-# Execute
 fleet publish --feature payments --node a1
 ```
 
-On first publish, Fleet prompts you to curate logical commits:
+Presentation grouping comes from the node's `present.plan` in the manifest (a pinned, user-curated list — never auto-derived):
+
+```yaml
+  a1:
+    kind: feature
+    desc: "Database schema migration"
+    base: null
+    ghost: "ghost/payments/a1"
+    status: in-review
+    present:
+      branch: "present/payments/a1"
+      plan:
+        - name: schema
+          sha_range: "abc123..def456"
+        - name: tests
+          sha_range: "def456..ghi789"
+```
 
 ```
-Curate logical commits for presentation of 'a1':
-  Ghost range: abc1234...def5678
-
-Enter logical commit plan (format: 'name:sha..sha' per line, empty line to finish):
-  Example: docs:abc123..def456
-           impl:def456..ghi789
-
-  > schema:abc123..def456
-  > tests:def456..ghi789
-  >
 ✓ Publish complete
   Branch: present/payments/a1
-  PR: #123 (https://github.com/.../pull/123)
+  PR: #123
 ```
 
----
+### 7. Merge-back (squash cleanup)
 
-### Merge-Back (Squash Cleanup)
-
-After PR #123 merges, drop `a1` and re-parent `a2` and `a3`:
+After PR #123 lands, drop `a1`'s commits onto `main` and re-parent `a2`:
 
 ```bash
-# Preview
 fleet merge --feature payments --node a1 --dry-run
-
-# Execute
-fleet merge --feature payments --node a1
 ```
 
-Output:
 ```
 DRY-RUN: Merge-back (squash cleanup via --onto)
   Node: a1
   Commits to drop: 5
   Children to re-parent: a2
   New base: main
+```
 
-Proceed? (yes/no): yes
+```bash
+fleet merge --feature payments --node a1
+```
+
+```
 ✓ Merge complete
   a1 → archived
   a2 → re-parented to main (5 commits dropped)
 ```
 
-Now `a2` is stacked directly on `main` with `a3` on top of `a2`.
-
----
-
-### Check Status
-
-View your feature DAG and node states:
-
-```bash
-fleet status --feature payments
-
-# Output:
-# Feature: payments
-# Nodes:
-#   a1 (feature) [archived]
-#     ghost: ghost/payments/a1
-#     desc: Database schema migration
-#   a2 (feature) [in-progress]
-#     ghost: ghost/payments/a2
-#     desc: ORM layer
-#   a3 (feature) [draft]
-#     ghost: ghost/payments/a3
-#     desc: API endpoint
-```
-
-Get structured JSON output:
-
-```bash
-fleet status --feature payments --json
-```
+`a2` now stacks directly on `main`, with `a3` on top of `a2`.
 
 ---
 
 ## Configuration Options
 
-### Manifest Fields
+The manifest (`~/.fleet/<feature>/manifest.yaml`) controls Fleet behavior. Full field reference in [references/MANIFEST-FORMAT.md](./references/MANIFEST-FORMAT.md).
 
-The manifest (`~/.fleet/<feature>/manifest.yaml`) controls Fleet behavior:
+| Field | Default | Purpose |
+|-------|---------|---------|
+| `feature` | *(required)* | Feature name |
+| `canonical` | `main` | Merge target branch |
+| `merge_mode` | `individual` | `individual` (staggered, topo-ordered) or `batch` (auto-cascade remaining) |
+| `max_worktrees` | `6` | Worktree pool size |
+| `nodes` | *(required)* | The DAG (feature / decision / artifact nodes) |
 
-```yaml
-feature: payments
+Node `status` values: `draft`, `in-review`, `merged`, `blocked`, `needs-rework`, `archived`.
 
-# Node definitions
-nodes:
-  a1:
-    kind: feature  # or 'decision' / 'artifact'
-    desc: Database schema migration
-    ghost: ghost/payments/a1
-    base: null  # null = root node (bases on main)
-    range:
-      base_sha: abc1234...
-      tip_sha: def5678...
-    status: archived  # draft | in-progress | blocked | archived
-    present:
-      branch: present/payments/a1
-      plan:
-        - name: schema
-          sha_range: abc123..def456
-        - name: tests
-          sha_range: def456..ghi789
-      stale: false
-
-  a2:
-    kind: feature
-    desc: ORM layer
-    ghost: ghost/payments/a2
-    base: a1  # base node (stacking)
-    range:
-      base_sha: def5678...
-      tip_sha: xyz9012...
-    status: in-progress
-
-# Merge strategy
-merge_mode: individual  # or 'batch'
-
-# Worktree pool size
-max_worktrees: 6
-
-# Decision-variant experimental feature
-experimental: false  # Set true to enable FR-17/FR-18
-```
+Decision-variant support is experimental — see below.
 
 ---
 
 ## Advanced Usage
 
-### Stacked Features
+### Deep stacks
 
-Work with deep stacks efficiently. Fleet handles cascade and cleanup automatically:
+The same commands scale to any depth. For a five-node stack (`index → ranking → filter → ui → docs`), author all five nodes in the manifest, create their ghost branches, then work bottom-up:
 
 ```bash
-# Stack 5 nodes
-fleet plan --feature search << 'EOF'
-index:    Indexing engine
-  ↓
-ranking:  Ranking algorithm (depends on index)
-  ↓
-filter:   Result filtering (depends on ranking)
-  ↓
-ui:       UI integration (depends on filter)
-  ↓
-docs:     Documentation (depends on UI)
-EOF
-
-fleet materialize --feature search
-
-# Work on each node; cascade propagates changes
-fleet work --feature search --node index
-# ... make commits ...
+# Commit to ghost/search/index, then propagate
 fleet cascade --feature search --node index
 
-fleet work --feature search --node ranking
-# ... make commits ...
+# Commit to ghost/search/ranking, then propagate
 fleet cascade --feature search --node ranking
 
-# Publish and merge each in order
+# Publish + merge each in topological order
 fleet publish --feature search --node index
-# PR #100 merges → auto-cleanup via merge-back
-fleet merge --feature search --node index
+fleet merge   --feature search --node index
 
 fleet publish --feature search --node ranking
-fleet merge --feature search --node ranking
-# ... repeat for filter, ui, docs ...
+fleet merge   --feature search --node ranking
+# ...filter, ui, docs
 ```
 
----
+With `merge_mode: batch`, merging one node auto-cascades the remaining nodes instead of requiring a `merge` per node.
 
-### Decision Variants (Experimental)
+### Decision variants (experimental)
 
-Fork multiple implementations at a decision point; resolve to one later:
+Fork alternative implementations at a decision node, then resolve to one. Define a `decision` node with `options` in the manifest:
+
+```yaml
+  orm_choice:
+    kind: decision
+    desc: "How to access the database?"
+    base: null
+    promoted: null
+    options:
+      optA:
+        ghost: "ghost/db/optA"    # SQLAlchemy ORM
+        size: small
+        spec_only: false
+      optB:
+        ghost: "ghost/db/optB"    # raw SQL query builder
+        size: small
+        spec_only: false
+    status: draft
+```
+
+A downstream node records which option it assumes via the `assumes` field (human-supplied, never auto-modified):
+
+```yaml
+  a1:
+    kind: feature
+    base: orm_choice
+    ghost: "ghost/db/a1"
+    assumes:
+      orm_choice:
+        option: optA
+        why: "Model layer relies on ORM session lifecycle"
+        surfaces: ["src/models.py"]
+        on_flip: rebuild
+    status: draft
+```
+
+Preview a resolution with the dry-run planner:
 
 ```bash
-# Define decision node (requires experimental: true in manifest)
-fleet plan --feature db << 'EOF'
-init:      Database initialization
-  ↓ (decision: orm_choice)
-    ├─ optA: Use SQLAlchemy ORM
-    └─ optB: Use raw SQL query builder
-EOF
-
-fleet materialize --feature db
-
-# Both options exist as branches; work on both in parallel
-fleet work --feature db --node optA
-# ... implement with SQLAlchemy ...
-
-fleet work --feature db --node optB
-# ... implement with raw SQL ...
-
-# Later, resolve to optA
-fleet resolve --feature db --decision orm_choice --chosen optA --dry-run
-
-# Preview (shows archived optB and rebuild prompts for assuming nodes)
-fleet resolve --feature db --decision orm_choice --chosen optA
-
-# Output:
-# DRY-RUN: Resolve decision node
-#   Decision: orm_choice
-#   Chosen: optA (Archive: optB)
-#   Re-parent descendants
-#   Rebuild prompts for assuming nodes: [a1]
-#
-# ✓ Decision resolved
-#   Promoted: optA
-#   Archived: optB
-#   Assuming node a1 marked needs-rework (lost assumption on optA)
+fleet dryrun --feature db --intent RESOLVE_DECISION --nodes orm_choice
 ```
 
-Any node that assumed `optB` is flagged `needs-rework` with a rebuild contract prompt.
+```
+DRY-RUN: Resolve decision node
+  Decision: orm_choice
+  Available options: optA, optB
+```
 
----
+The `dryrun` subcommand lists the options for a decision node. When resolution executes (through the natural-language interface, which supplies the chosen option), the losing option is archived, descendants re-parent onto the winner, and any node whose `assumes` option lost is flagged `needs-rework` with a rebuild contract derived from its `assumes.on_flip` strategy.
 
-### Handle Conflicts
+> Decision resolution requires `experimental: true` in the manifest.
 
-If a cascade hits a conflict, Fleet marks the affected node `blocked` and guides resolution:
+### Handle conflicts
+
+If a cascade hits a conflict, Fleet marks the node `blocked` and stops:
 
 ```bash
 fleet cascade --feature payments --node a1
+```
 
-# Output:
-# FLEET_010: Merge conflict during cascade.
-# Nodes marked blocked.
-# Resolve in worktree via 'git rebase --continue', then retry cascade.
+```
+FLEET_010: Merge conflict during cascade.
+Nodes marked blocked.
+Resolve in worktree via 'git rebase --continue', then retry cascade.
+```
 
-# Manually resolve
+Resolve, then retry — cascade is idempotent and finishes the remaining descendants:
+
+```bash
 cd ~/.fleet/payments/wt/wt-2
-git status
-# (fix conflicts in editor)
+# fix conflicts
 git add .
 git rebase --continue
 
-# Retry cascade (idempotent; will finish remaining descendants)
 fleet cascade --feature payments --node a1
-# ✓ Cascade complete
 ```
 
----
+```
+✓ Cascade complete
+```
 
-### Force-Push Lease-Fail Recovery
+### Force-push lease-fail recovery
 
-If a reviewer pushes to a presentation branch while you're trying to re-push:
+`publish` force-pushes with `--force-with-lease`. If a reviewer pushed to the presentation branch first, Fleet stops and offers a choice:
 
 ```bash
 fleet publish --feature payments --node a1
-
-# Output:
-# ! Lease failed on force-push (remote ref updated)
-#   Reviewer pushed commits to present/payments/a1
-#
-# Choices:
-#   (a) Incorporate reviewer commits → merge into ghost + regenerate
-#   (b) Discard reviewer work (force-push anyway)
-#   (c) Manual (user resolves on GitHub)
-#
-# Choice: a
-# → git merge origin/present/payments/a1
-# → regenerate presentation
-# ✓ Publish complete
 ```
 
----
+```
+! Lease failed on force-push (remote ref updated)
+  Reviewer pushed commits to present/payments/a1
 
-### Dry-Run for Planning
+Choices:
+  (a) Incorporate reviewer commits → merge into ghost + regenerate
+  (b) Discard reviewer work (force-push anyway)
+  (c) Manual (resolve on GitHub)
+
+Choice: a
+→ git merge origin/present/payments/a1
+→ regenerate presentation
+✓ Publish complete
+```
+
+### Dry-run planner
 
 Preview any operation without executing:
 
 ```bash
 fleet dryrun --feature payments --intent CASCADE --nodes a1
-
-# Output:
-# DRY-RUN: Cascade rebase
-#   Root node: a1
-#   Descendants: a2, a3
-#   Parked worktrees: 1
-#   (Conflicts possible...)
 ```
+
+```
+DRY-RUN: Cascade rebase
+  Root node: a1
+  Descendants to rebase: a2, a3
+  Parked worktrees: 1
+    - ~/.fleet/payments/wt/wt-2 (ghost/payments/a2)
+  Note: Conflicts possible if base has conflicting changes.
+```
+
+### Natural-language classification
+
+`classify` maps a phrase to an intent and (with `--feature`) fuzzy-matches nodes:
+
+```bash
+fleet classify "merge a1 back to main" --feature payments --json
+```
+
+```json
+{
+  "intent": "MERGE",
+  "feature": "payments",
+  "nodes": ["a1"],
+  "args": {},
+  "confidence": 0.82,
+  "requires_confirmation": false
+}
+```
+
+Phrases below 0.7 confidence, or with ambiguous node matches, fall back to `STATUS` or require explicit confirmation before any destructive intent runs.
 
 ---
 
 ## Error Handling
 
-Fleet uses error codes (FLEET_NNN) for deterministic recovery. See `references/ERROR-CODES.md` for the full registry.
+Fleet uses stable `FLEET_NNN` codes with recovery guidance. Full registry in [references/ERROR-CODES.md](./references/ERROR-CODES.md).
 
-### Common Errors & Recovery
+#### Manifest not found (FLEET_001)
 
-#### **Manifest not found (FLEET_001)**
 ```bash
 fleet status --feature payments
 # ✗ Error: FLEET_001: Manifest not found for feature 'payments'
-# Recovery: Run `fleet init --feature payments`
+# Recovery: Run `fleet init --feature payments`, then author the manifest.
 ```
 
-#### **DAG divergence detected (FLEET_061)**
+#### DAG divergence detected (FLEET_061)
+
 ```bash
 fleet cascade --feature payments --node a1
 # ✗ Error: FLEET_061: DAG divergence detected: a2: git parent ≠ manifest base
-# Recovery: Manual edit diverged git state. Reconcile won't auto-fix.
-#           Update manifest or re-sync with git.
+# Recovery: A manual edit diverged git from the manifest. Reconcile will not
+#           auto-fix. Update the manifest or re-sync the branch with git.
 ```
 
-#### **Out-of-order merge blocked (FLEET_050)**
+#### Out-of-order merge blocked (FLEET_050)
+
 ```bash
 fleet merge --feature payments --node a2
 # ✗ Error: FLEET_050: Out-of-order merge blocked
@@ -431,7 +425,8 @@ fleet merge --feature payments --node a2
 # Recovery: Merge ancestors first (a1), then retry.
 ```
 
-#### **Worktree has uncommitted changes (FLEET_040)**
+#### Worktree has uncommitted changes (FLEET_040)
+
 ```bash
 fleet cascade --feature payments --node a1
 # ✗ Error: FLEET_040: Worktree has uncommitted changes; cannot cascade.
@@ -443,48 +438,30 @@ fleet cascade --feature payments --node a1
 
 ## Reconciliation
 
-Fleet automatically reconciles git state with manifest before destructive operations. To manually reconcile:
+Fleet reconciles git state with the manifest before destructive operations. To reconcile manually:
 
 ```bash
 fleet reconcile --feature payments
-
-# Output:
-# ✓ Reconciliation complete for payments
-#   Unobserved writes: a1
-#   Divergences: 0
 ```
 
-This recomputes:
-- Node tip SHAs from git refs
-- Staleness flags (artifact and presentation)
-- DAG divergence checks
+```
+✓ Reconciliation complete for payments
+  Unobserved writes: a1
+  Divergences: 0
+```
 
----
-
-## Reference: Subcommands
-
-| Subcommand | Purpose |
-|-----------|---------|
-| `init` | Initialize fleet for a feature |
-| `status` | Show feature DAG and node states |
-| `cascade` | Cascade rebase descendants |
-| `merge` | Merge-back (squash cleanup) |
-| `publish` | Publish presentation branch |
-| `reconcile` | Reconcile manifest with git |
-| `classify` | Classify natural language intent (internal) |
-| `dryrun` | Preview operation impact |
+Reconcile recomputes derivable fields — node tip SHAs, presentation and artifact staleness, and DAG divergence — from live git refs.
 
 ---
 
 ## Tips & Best Practices
 
-1. **Always use dry-run first:** Get familiar with the impact before confirming destructive ops.
-2. **Keep manifests clean:** Regularly archive or delete old features to avoid clutter.
-3. **One feature at a time:** Fleet is single-writer; don't run multiple fleet processes on the same feature concurrently.
-4. **Commit often:** Frequent commits in worktrees make cascade and cleanup easier to understand.
-5. **Review PRs before merge-back:** Cascade doesn't run after PR merge; manually trigger merge-back when ready.
+1. **Dry-run first.** Learn the impact of `cascade`, `merge`, and `publish` before confirming.
+2. **Let Fleet own derivable fields.** Never hand-edit `range.*`, `present.stale`, or `deps_sha` — reconcile overwrites them.
+3. **One writer per feature.** Fleet is single-writer and lock-guarded; don't run two processes on the same feature.
+4. **Commit often in worktrees.** Small commits make cascade and merge-back easier to read in dry-run.
+5. **Trigger merge-back yourself.** Fleet does not watch for merged PRs; run `merge` when a PR lands.
 
 ---
 
-**Version:** 1.0 (Tier 4 implementation)  
-**Last Updated:** 2026-07-27
+**Version:** 1.0
