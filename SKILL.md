@@ -16,7 +16,7 @@
 
 Fleet enables engineers to work with complex multi-node git workflows: stacked features, parallel branches, decision points, and build artifacts. Instead of manually rebasing when bases change, Fleet provides:
 
-- **Cascade:** Automatically rebase all descendants when a base node changes, handling conflicts gracefully.
+- **Cascade:** Automatically rebase all descendants when a base node changes. On conflict, the affected node is marked `blocked` and the rebase is aborted for manual resolution (not silently merged).
 - **Squash Cleanup (Merge-Back):** Drop a node's commits onto main, re-parenting children with a single deterministic operation.
 - **Presentation:** Curate and generate logical commit groupings from technical branches, with PR integration.
 - **Decision Variants:** Fork multiple implementation branches at a decision point; resolve to one and automatically re-parent others.
@@ -80,7 +80,19 @@ Example: *"Start work on node a2"*
 Keywords: "commit", "done", "finish", "complete", "mark"  
 Example: *"Mark a1 done"*
 
-**Action:** Change node status from `draft` → `in-progress`. Run cascade on node (rebase descendants). Cascade may conflict; surface to user.
+**Action:** Run cascade on the node — rebase each descendant onto its parent's
+**new tip** via per-node `git rebase --update-refs --onto <new_base> <old_base>
+<ghost>`, in topological order (parents before children). Artifacts are not
+rebased (only marked stale). Conflicts mark the node `blocked` and abort the
+rebase (FLEET_010).
+
+**Real command:** `fleet cascade --feature <f> --node <n> [--dry-run]` (there is
+no `fleet commit` subcommand).
+
+**Verify:** cascade prints `✓ Cascade complete` + a `rebased` list, but confirm
+refs actually moved (`git merge-base --is-ancestor <root_ghost> <descendant_ghost>`
+or a follow-up `reconcile` showing no divergence) — a success message alone is
+not proof the DAG advanced.
 
 **Safety:** **Destructive.** Requires dry-run preview + confirmation. Confidence gate: <0.7 or ambiguous nodes require explicit confirmation.
 
@@ -142,7 +154,7 @@ Example: *"Merge a1 back to main"*
 **Action:**
 - Validate topological order (individual mode): all ancestors must be archived.
 - Show commits to drop, children to re-parent.
-- Rebase children onto main via `git rebase --onto` (deterministic, single pass for all children).
+- Re-parent children onto main via **per-child** `git rebase --onto main <node_tip> <child_ghost>` (multi-child adds `--update-refs`; zero-child = archive only, no rebase). NOT a single `A..B` range pass.
 - Mark node archived, clear presentation.
 - Update children's base_sha.
 - (Batch mode: auto-cascade remaining nodes.)
@@ -253,52 +265,62 @@ Fleet uses error codes (FLEET_NNN) for deterministic recovery guidance.
 
 ### Common Errors & Recovery
 
-#### **FLEET_001: Manifest not found**
-**Cause:** Feature not initialized.  
-**Recovery:** Run `fleet init --feature <name>` to create manifest structure.
+> Codes below are the ones the source actually raises. `FLEET_001`, `FLEET_070`,
+> and `FLEET_071` do **not** exist — do not branch on them. Low-confidence /
+> ambiguous-node handling is surfaced interactively by the NLI layer (see
+> "Safety Gates"), not via an error code.
 
-#### **FLEET_002: DAG divergence detected**
-**Cause:** Git parent ≠ manifest base (manual rebase behind fleet's back).  
-**Recovery:** Reconcile and inspect. If divergence is valid (e.g., manual cherry-pick), update manifest `assumes` field to document. Do NOT auto-fix.
+#### **FLEET_002: DAG has a cycle**
+**Cause:** Manifest node edges form a cycle (e.g. a1.base=a2 and a2.base=a1); caught by cycle detection during schema validation. (This is a **cycle**, not a rebase divergence — divergence is reported by `reconcile` as a non-fatal "git parent ≠ manifest base" note, no error code.)  
+**Recovery:** Fix the offending `base`/`deps` edge in the manifest so the DAG is acyclic.  
+**Source:** `fleet_manifest.py` (`_has_cycle`).
 
 #### **FLEET_003: Schema validation failed**
-**Cause:** Manifest corrupted or invalid JSON/YAML.  
-**Recovery:** Restore from version control or WAL backup. Check manifest syntax.
+**Cause:** Manifest missing a required field, `nodes` not a dict, a node missing `kind`/invalid `kind`, or a decision node missing its `options` dict.  
+**Recovery:** Restore from version control or WAL backup; fix the field flagged in the message.  
+**Source:** `fleet_manifest.py`.
 
 #### **FLEET_010: Merge conflict during cascade**
-**Cause:** Base node changes conflict with descendant branches.  
-**Recovery:** 
-1. Run `git rebase --continue` in conflicted worktree or main repo.
-2. Mark conflict resolved.
-3. Retry cascade (idempotent; will finish remaining descendants).
+**Cause:** A descendant rebase conflicts while cascading onto the moved base. Affected nodes are marked `blocked` and the rebase is auto-aborted (`git rebase --abort`).  
+**Recovery:**
+1. Open the blocked node's ghost branch, resolve the overlap manually.
+2. Re-run cascade — it is idempotent and finishes the remaining descendants.  
+**Source:** `fleet_cascade.py`.
 
-#### **FLEET_011: Merge conflict during cleanup**
-**Cause:** Children cannot re-parent to main due to conflicts.  
-**Recovery:** Same as FLEET_010.
+#### **FLEET_011: Merge conflict during cleanup (merge-back)**
+**Cause:** A child cannot re-parent onto main during merge-back due to conflicts. Node marked `blocked`.  
+**Recovery:** Same as FLEET_010 (resolve overlap, retry merge).  
+**Source:** `fleet_merge.py`.
 
-#### **FLEET_020: Force-push lease failed**
-**Cause:** Remote presentation branch updated concurrently (reviewer pushed).  
-**Recovery:** Lease-fail handler (see above): incorporate or discard reviewer commits.
+#### **FLEET_020: Force-push lease failed** *(handler-surfaced, not thrown)*
+**Cause:** Remote presentation branch updated concurrently (reviewer pushed) → `--force-with-lease` refused.  
+**Recovery:** The lease-fail handler offers **incorporate / discard / manual** (see "Safety Gates"). This is surfaced by the publish handler, not raised as an exception code.  
+**Source:** `fleet_merge.py` / `fleet_present.py` handler path.
 
 #### **FLEET_030: Lock timeout**
-**Cause:** Another fleet process holding lock >30min (crashed process).  
-**Recovery:** Check `ps aux | grep fleet` for stale processes. Kill manually if needed. Lock will auto-reclaim after 30min.
+**Cause:** Another fleet process held the feature lock beyond the timeout.  
+**Recovery:** Check `ps aux | grep fleet` for a stale/crashed process; kill it. Then retry. (Note: `flock` is per-open-fd — never call a lock-acquiring op from inside another that already holds the lock; pass `lock_obj` through instead.)  
+**Source:** `fleet_lock.py`, `fleet_wal.py`.
 
 #### **FLEET_040: Worktree has uncommitted changes**
-**Cause:** Cascade needs to park worktree but has dirty state.  
-**Recovery:** Commit or stash changes in worktree, then retry cascade.
+**Cause:** Cascade/detach/evict needs to park a worktree that is dirty.  
+**Recovery:** Commit or stash the worktree's changes, then retry. (Cascade auto-parks and re-attaches clean worktrees; only dirty ones block.)  
+**Source:** `fleet_cascade.py`, `fleet_worktree.py`.
+
+#### **FLEET_041: Worktree pool full**
+**Cause:** Pool at `max_worktrees` (default 6) and no idle worktree to evict.  
+**Recovery:** Finish/commit work in an existing worktree so it becomes evictable, or raise `max_worktrees` in the manifest.  
+**Source:** `fleet_worktree.py`.
 
 #### **FLEET_050: Out-of-order merge blocked**
-**Cause:** Attempted merge-back before ancestor nodes archived.  
-**Recovery:** Merge ancestors first (topological order enforced for data safety).
+**Cause:** Merge-back attempted before an ancestor node is archived.  
+**Recovery:** Merge ancestors first (topological order enforced for data safety).  
+**Source:** `fleet_merge.py`.
 
-#### **FLEET_070: Low confidence; manual confirmation required**
-**Cause:** NLI classification ambiguous or low confidence.  
-**Recovery:** Confirm choice explicitly or rephrase utterance more clearly.
-
-#### **FLEET_071: Fuzzy match ambiguous**
-**Cause:** Multiple nodes matched keyword.  
-**Recovery:** Disambiguate interactively (pick from list) or reference node by ghost branch name.
+#### **FLEET_099: Decision resolution not enabled**
+**Cause:** `RESOLVE_DECISION` attempted without the experimental gate.  
+**Recovery:** Set top-level `experimental: true` in the manifest, then retry.  
+**Source:** `fleet_decision.py` (`decide_resolve`).
 
 ---
 
@@ -358,7 +380,7 @@ nodes:
 **Commands used:**
 - `git rev-parse` — get SHA for refs
 - `git merge-base` — compute common base
-- `git rebase --update-refs` — cascading rebase
+- `git rebase --update-refs --onto <new_base> <old_base> <ghost>` — per-node cascading rebase (topological, parents first)
 - `git push --force-with-lease` — safe force-push
 - `git worktree` — manage isolated worktrees
 - `git branch -m` — rename branches (archive old options)
@@ -445,7 +467,10 @@ stale: (true if any dep changed)
 ### Idempotence Guarantees
 
 All operations are **idempotent**:
-- Cascade: if descendant already rebased, skip (WAL pre-image check).
+- Cascade: skip a descendant only when its recorded base already equals the
+  parent's new tip (per-node `old_base == new_base` check). "Already based on
+  the root's *base*" is NOT the skip condition — that mistake produced a
+  no-op false-success historically. Always verify refs moved (see COMMIT).
 - Merge-back: if child already re-parented, skip.
 - Publish: same plan + ghost → byte-identical commits.
 - Reconcile: safe to call repeatedly; no side effects.
@@ -458,88 +483,76 @@ All operations are **idempotent**:
 
 ## Examples
 
+> **Real CLI surface.** `fleet` exposes exactly these subcommands:
+> `init` (stub — prints only, writes nothing), `status`, `cascade`, `merge`,
+> `publish`, `reconcile`, `classify`, `dryrun`. There is **no** `fleet plan`,
+> `materialize`, `work`, `assume`, `resolve`, or `commit` subcommand. Those
+> intents map to manifest edits + git + the module scripts below:
+> - **RESOLVE_DECISION** → `python scripts/fleet_decision.py <feature> <decision> <option>` (experimental)
+> - **PUBLISH** → `fleet publish …` OR `python scripts/fleet_present.py <feature> <node>`
+> - **WORK / is-dirty** → `python scripts/fleet_worktree.py <feature> is-dirty <path>`
+> - **PLAN / MATERIALIZE / assume / artifact-refresh** → edit the manifest + git branch, then `fleet reconcile`.
+> Every `fleet` command must run with **cwd = the repo clone** (modules operate on
+> the process cwd; the manifest `repo:` field is not read for main git ops).
+
 ### Scenario 1: Stack 3 nodes, cascade when base changes
 
 ```bash
-# Define plan
-fleet plan --feature auth << 'EOF'
-a1: Password reset endpoint
-  ↓
-a2: Reset email template
-  ↓
-a3: Send reset URL
-EOF
+# PLAN + MATERIALIZE: seed the manifest, then create ghost branches by hand.
+# (init is a stub; write the manifest via manifest_write_atomic, or edit YAML.)
+#   ~/.fleet/auth/manifest.yaml  with nodes a1, a2(base=a1), a3(base=a2)
+git branch ghost/auth/a1 main
+git branch ghost/auth/a2 ghost/auth/a1
+git branch ghost/auth/a3 ghost/auth/a2
+# ... commit work onto each ghost branch ...
+fleet reconcile --feature auth        # fills range.base_sha / tip_sha
 
-# Materialize
-fleet materialize --feature auth
+# COMMIT intent = cascade. Preview, then execute.
+fleet cascade --feature auth --node a1 --dry-run
+# DRY-RUN: Cascade rebase
+#   Descendants to rebase: a2, a3
 
-# Work on a1
-fleet work --feature auth --node a1
-cd ~/.fleet/auth/wt/wt-1
-# ... make changes, commit ...
+fleet cascade --feature auth --node a1     # prompts yes/no
+# ✓ Cascade complete  (a2, a3 rebased onto a1's new tip)
+# VERIFY (do not trust the printed status alone — see note below):
+git merge-base --is-ancestor ghost/auth/a1 ghost/auth/a2 && echo "a2 rebased"
 
-# Mark done (cascade to a2, a3)
-fleet commit --feature auth --node a1 --dry-run
-# DRY-RUN: Cascade a1
-#   Descendants: [a2, a3]
-#   Rebase range: base^..max_tip (handles both serial + parallel)
-
-fleet commit --feature auth --node a1
-# ✓ Cascade complete (a2, a3 rebased)
-
-# Publish each node
+# PUBLISH each node (force-push + PR). Needs a remote + gh.
 fleet publish --feature auth --node a1
-# → present/auth/a1 created, PR #123 opened
-
 fleet publish --feature auth --node a2
-# → present/auth/a2 created, PR #124 opened
 ```
 
 ### Scenario 2: Decision branching
 
 ```bash
-# Define decision node
-fleet plan --feature db << 'EOF'
-init: Database migration
-  ↓ (decision: use_orm)
-    ├─ optA: Use SQLAlchemy ORM
-    └─ optB: Use raw SQL with query builder
-EOF
+# PLAN a decision node d1 with options optA/optB in the manifest; set
+# top-level `experimental: true` (else FLEET_099). MATERIALIZE option ghosts.
+git branch ghost/db/optA main
+git branch ghost/db/optB main
+# Record an assumption on a dependent node by editing the manifest:
+#   nodes.a1.assumes.d1 = {option: optA, on_flip: rebuild}
 
-# Materialize (both options exist)
-fleet materialize --feature db
-
-# Assume a1 depends on optA
-fleet assume --feature db --node a1 --decision use_orm --option optA
-
-# Work on both...
-# Later, resolve to optB
-fleet resolve --feature db --decision use_orm --chosen optB --dry-run
-# DRY-RUN: Resolve decision node
-#   Chosen: optB (Archive: optA)
-#   Re-parent descendants
-
-fleet resolve --feature db --decision use_orm --chosen optB
-# ✓ Decision resolved; a1 marked needs-rework (assumption lost)
+# RESOLVE_DECISION is a module script (no `fleet resolve` subcommand):
+python scripts/fleet_decision.py db d1 optB
+# ✓ optB promoted; optA archived (renamed archive/…); descendants re-parented
+#   onto optB via cascade; assuming nodes emit a rebuild-contract prompt.
 ```
 
 ### Scenario 3: Merge-back sequence
 
 ```bash
-# Merge a1 (no children)
+# Merge a1 first (topological order enforced; ancestors before descendants).
 fleet merge --feature auth --node a1 --dry-run
-# DRY-RUN: Merge-back
+# DRY-RUN: Merge-back (squash cleanup via --onto)
 #   Commits to drop: 5
 #   Children to re-parent: [a2]
 #   New base: main
 
-fleet merge --feature auth --node a1
+fleet merge --feature auth --node a1       # prompts yes/no
 # ✓ a1 archived, a2 re-parented onto main
 
-# Now a2 ready to merge
 fleet merge --feature auth --node a2
 # ✓ a2 archived, a3 re-parented onto main
-# (Batch mode would auto-cascade remaining)
 ```
 
 ---
@@ -547,10 +560,10 @@ fleet merge --feature auth --node a2
 ## Troubleshooting
 
 ### "Manifest not found"
-→ Run `fleet init --feature <name>`
+→ Seed `~/.fleet/<feature>/manifest.yaml` (via `manifest_write_atomic` or by hand). `fleet init` is a stub and does not create it. There is no FLEET_001.
 
-### "DAG divergence detected"
-→ Manual edit diverged git state. Reconcile won't auto-fix. Update manifest or re-sync with git.
+### "DAG has a cycle" (FLEET_002)
+→ A `base`/`deps` edge forms a loop. Fix the offending edge so the DAG is acyclic. (A rebase *divergence* is different — reconcile reports it as a non-fatal note, no code.)
 
 ### "Cascade blocked by dirty worktree"
 → Commit or stash changes, retry cascade.
