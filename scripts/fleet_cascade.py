@@ -32,7 +32,8 @@ def cascade(
     feature: str,
     root_node: str,
     dry_run: bool = False,
-    lock_obj: Optional[IO] = None
+    lock_obj: Optional[IO] = None,
+    rebase_base_sha: Optional[str] = None
 ) -> Dict:
     """
     Cascade descendants via git rebase --update-refs.
@@ -45,6 +46,11 @@ def cascade(
         root_node: Root node name (changed node whose descendants rebase onto it)
         dry_run: If True, print plan without executing
         lock_obj: Optional lock object (if provided, use it; else acquire internally)
+        rebase_base_sha: Optional explicit base SHA to rebase descendants onto.
+            Overrides root_node.range.base_sha. Required when the root has no
+            git base of its own (e.g. a decision node, whose descendants must
+            re-parent onto the promoted option's ghost tip rather than the
+            decision node itself).
 
     Returns:
         Dict with {status, rebased, conflicts, parked_worktrees, error?, action?}
@@ -168,11 +174,17 @@ def cascade(
                 timeout=5
             )
 
-            # Compute rebase range: root_base^..max_tip
-            root_node_obj = manifest.get("nodes", {}).get(root_node, {})
-            root_base_sha = root_node_obj.get("range", {}).get("base_sha")
-            if not root_base_sha:
-                raise CascadeError(f"Root node {root_node} has no base_sha")
+            # Compute rebase base. An explicit rebase_base_sha (e.g. the
+            # promoted option's ghost tip during decision re-parenting) takes
+            # precedence over the root node's own base. This is required for
+            # decision nodes, which have no git base_sha of their own.
+            if rebase_base_sha:
+                root_base_sha = rebase_base_sha
+            else:
+                root_node_obj = manifest.get("nodes", {}).get(root_node, {})
+                root_base_sha = root_node_obj.get("range", {}).get("base_sha")
+                if not root_base_sha:
+                    raise CascadeError(f"Root node {root_node} has no base_sha")
 
             # Find max descendant (deepest topologically, tie-break by SHA)
             max_desc = get_max_descendant(descendants, manifest, root_node)

@@ -115,8 +115,18 @@ def decide_resolve(
             except ImportError:
                 raise DecisionError("Failed to import cascade module (fleet_cascade.py not found)")
 
+            # Descendants of a decision node re-parent onto the PROMOTED
+            # option's ghost, not the decision node itself (which has no git
+            # base_sha). Pass the winning option's ghost ref as the explicit
+            # rebase base; git rebase resolves the ref to its tip.
             try:
-                cascade_result = cascade(feature, decision_node, dry_run=False, lock_obj=lock_obj)
+                cascade_result = cascade(
+                    feature,
+                    decision_node,
+                    dry_run=False,
+                    lock_obj=lock_obj,
+                    rebase_base_sha=chosen_ghost
+                )
                 if cascade_result.get("error"):
                     # Mark descendants blocked on cascade error
                     for desc in descendants:
