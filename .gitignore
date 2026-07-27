@@ -1,0 +1,20 @@
+*.pyc
+__pycache__/
+*.bak
+.tmp/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.swp
+*.swo
+.DS_Store
+
+# Forge orchestration workspace (separate .forge/.git repo).
+.forge/
+
+# Vendored wheelhouse: COMMIT these for offline reproducible installs.
+!vendor/wheels/
+!vendor/wheels/*.whl

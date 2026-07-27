@@ -1,0 +1,191 @@
+# Manifest Schema — Fleet v1
+# YAML schema defining node types, required fields, enums, defaults, and constraints.
+
+$schema: "http://json-schema.org/draft-07/schema#"
+title: Fleet Manifest
+description: Manifest defining feature DAG, ghost/presentation branches, and node states.
+
+type: object
+
+required:
+  - feature
+  - nodes
+
+properties:
+  feature:
+    type: string
+    description: Feature name (e.g., "payments")
+
+  repo:
+    type: string
+    description: Repository root path
+
+  canonical:
+    type: string
+    description: Canonical branch (default "main")
+    default: "main"
+
+  merge_mode:
+    type: string
+    enum: ["individual", "batch"]
+    description: Merge strategy (staggered vs. batch)
+    default: "individual"
+
+  max_worktrees:
+    type: integer
+    description: Maximum worktree pool size
+    default: 6
+    minimum: 1
+
+  nodes:
+    type: object
+    description: DAG nodes (features, decisions, artifacts)
+    additionalProperties:
+      $ref: "#/definitions/node"
+
+definitions:
+  node:
+    type: object
+    required:
+      - kind
+    properties:
+      kind:
+        type: string
+        enum: ["feature", "decision", "artifact"]
+        description: Node type
+
+      desc:
+        type: string
+        description: Human-readable description for NL resolution
+
+      base:
+        type: [string, "null"]
+        description: Parent node name (for feature stacking) or null
+
+      ghost:
+        type: [string, "null"]
+        description: Ghost branch name (local working branches) or null if not materialized
+
+      range:
+        type: object
+        description: Cached commit range (derivable, recomputed by reconcile)
+        properties:
+          base_sha:
+            type: [string, "null"]
+            description: Merge-base SHA with base branch
+          tip_sha:
+            type: [string, "null"]
+            description: Current ghost tip SHA
+
+      worktree:
+        type: [string, "null"]
+        description: Allocated worktree ID (e.g., "wt-1") or null if idle
+
+      status:
+        type: string
+        enum: ["draft", "in-review", "merged", "blocked", "needs-rework", "archived"]
+        description: Node state
+        default: "draft"
+
+      assumes:
+        type: object
+        description: Non-derivable intent (decision assumptions, user-supplied)
+        additionalProperties:
+          type: object
+          properties:
+            option:
+              type: string
+              description: Assumed decision option
+            why:
+              type: string
+              description: Reason for assumption
+            surfaces:
+              type: array
+              items:
+                type: string
+              description: Files affected by this assumption
+            on_flip:
+              type: string
+              enum: ["rebuild", "rebase", "manual"]
+              description: Strategy when assumption flips
+
+      present:
+        type: [object, "null"]
+        description: Presentation record (feature-only, reviewable branch)
+        properties:
+          branch:
+            type: string
+            description: Presentation branch name (e.g., "present/pay/a1")
+          pr:
+            type: [integer, "null"]
+            description: GitHub PR number
+          stale:
+            type: boolean
+            description: True if ghost moved since last regeneration
+            default: false
+          source_tip_sha:
+            type: [string, "null"]
+            description: Ghost tip SHA at last regeneration
+          plan:
+            type: array
+            description: Pinned logical commit grouping (deterministic regeneration)
+            items:
+              type: object
+              properties:
+                name:
+                  type: string
+                  description: Logical commit name (e.g., "docs", "impl", "tests")
+                sha_range:
+                  type: string
+                  description: Commit range (e.g., "abc123..def456")
+
+      # Decision-specific fields
+      promoted:
+        type: [string, "null"]
+        description: Chosen option (for decision nodes)
+
+      options:
+        type: object
+        description: Decision options (decision-only)
+        additionalProperties:
+          type: object
+          properties:
+            ghost:
+              type: string
+              description: Option branch name
+            size:
+              type: string
+              enum: ["small", "big"]
+              description: Option scope (small = live branch, big = spec-only until chosen)
+            spec_only:
+              type: boolean
+              description: True if not materialized as branch yet
+
+      # Artifact-specific fields
+      deps:
+        type: array
+        description: Dependency node names (artifact-only)
+        items:
+          type: string
+
+      deps_sha:
+        type: object
+        description: Cached dependency SHAs (derivable, recomputed by reconcile)
+        additionalProperties:
+          type: string
+
+      stale:
+        type: boolean
+        description: True if any dep has changed (artifact-only, derivable)
+        default: false
+
+additionalProperties: false
+
+# Constraints (enforced by manifest_validate):
+# 1. Nodes must not form cycles (base for features, deps for artifacts)
+# 2. Decision nodes must have options dict
+# 3. Artifact nodes must have deps list
+# 4. range.tip_sha is owned by fleet; never manually edited
+# 5. assumes.* is never auto-generated; human-supplied only
+# 6. present.plan is explicit; never silently rederived
+# 7. stale flags are derivable; recomputed on every reconcile
