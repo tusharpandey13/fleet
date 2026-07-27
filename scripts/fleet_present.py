@@ -153,7 +153,7 @@ def present_gen(
                 name = item["name"]
 
                 try:
-                    # Get commits in range
+                    # Get commits in range to verify it's non-empty
                     result = subprocess.run(
                         ["git", "rev-list", sha_range],
                         capture_output=True,
@@ -167,22 +167,84 @@ def present_gen(
                         print(f"  Skipping empty range: {sha_range}")
                         continue
 
-                    # Squash: reset --soft to base commit, then commit with name
+                    # Extract base and tip from range
                     base_sha = sha_range.split("..")[0]
+                    tip_sha = sha_range.split("..")[-1]
 
+                    # Get the tree SHA of the tip commit (represents all changes)
+                    tree_result = subprocess.run(
+                        ["git", "rev-parse", f"{tip_sha}^{{tree}}"],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                        timeout=10
+                    )
+                    tip_tree_sha = tree_result.stdout.strip()
+
+                    # Cherry-pick the range onto the presentation branch.
+                    # If any commit in the range conflicts, git leaves the
+                    # cherry-pick sequence in progress and the index/worktree
+                    # dirty. We must abort it before raising, otherwise the
+                    # subsequent "reset --soft HEAD~N" would operate on an
+                    # inconsistent HEAD and could silently drop changes.
+                    cherry = subprocess.run(
+                        ["git", "cherry-pick", f"{base_sha}..{tip_sha}"],
+                        capture_output=True,
+                        text=True,
+                        timeout=10
+                    )
+                    if cherry.returncode != 0:
+                        # Roll back the partial cherry-pick so the worktree is
+                        # restored to a clean state before we surface the error.
+                        subprocess.run(
+                            ["git", "cherry-pick", "--abort"],
+                            capture_output=True,
+                            timeout=10
+                        )
+                        raise PresentError(
+                            f"Failed to replay commit '{name}': cherry-pick of "
+                            f"range {sha_range} did not apply cleanly "
+                            f"(conflict or error): {cherry.stderr.strip()}"
+                        )
+
+                    # Soft reset to squash all cherry-picked commits into the
+                    # index while keeping HEAD at the range base. len(commits)
+                    # is the exact number of commits just applied, so HEAD~N
+                    # lands on base_sha.
                     subprocess.run(
-                        ["git", "reset", "--soft", base_sha],
+                        ["git", "reset", "--soft", "HEAD~{}".format(len(commits))],
                         check=True,
                         capture_output=True,
                         timeout=10
                     )
 
+                    # Create squashed commit with logical name
                     subprocess.run(
                         ["git", "commit", "-m", name],
                         check=True,
                         capture_output=True,
                         timeout=10
                     )
+
+                    # Invariant: the squashed presentation commit must have the
+                    # exact same tree as the ghost tip. If it does not, the
+                    # replay silently lost or altered content and we must NOT
+                    # push it.
+                    head_tree_result = subprocess.run(
+                        ["git", "rev-parse", "HEAD^{tree}"],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                        timeout=10
+                    )
+                    head_tree_sha = head_tree_result.stdout.strip()
+                    if head_tree_sha != tip_tree_sha:
+                        raise PresentError(
+                            f"Replay tree mismatch for '{name}': presentation "
+                            f"tree {head_tree_sha} != ghost tip tree "
+                            f"{tip_tree_sha}. Aborting publish to avoid pushing "
+                            f"inconsistent content."
+                        )
                 except subprocess.CalledProcessError as e:
                     raise PresentError(f"Failed to replay commit '{name}': {e}")
 

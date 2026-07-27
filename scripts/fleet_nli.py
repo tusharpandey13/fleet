@@ -132,8 +132,22 @@ def nli_classify(utterance: str, feature: Optional[str] = None) -> Dict:
         intent = "STATUS"
         confidence = 0.5
     else:
-        intent = max(intent_scores, key=intent_scores.get)
-        confidence = intent_scores[intent]
+        # Check for "preview" presence with contextual modifiers: if "preview" appears
+        # with either an operation verb (merging/cascading/etc) or "dry", DRYRUN
+        # takes precedence to avoid ambiguity between PUBLISH and DRYRUN.
+        has_preview = "preview" in utterance_lower
+        operation_verbs = ["merging", "cascading", "committing", "publishing", "working"]
+        has_operation_verb = any(verb in utterance_lower for verb in operation_verbs)
+        has_dry_signal = "dry" in utterance_lower
+
+        if has_preview and (has_operation_verb or has_dry_signal) and "DRYRUN" in intent_scores:
+            # Explicit preview+context pattern (verb or dry): use DRYRUN
+            intent = "DRYRUN"
+            confidence = intent_scores["DRYRUN"]
+        else:
+            # Standard: pick highest-scoring intent
+            intent = max(intent_scores, key=intent_scores.get)
+            confidence = intent_scores[intent]
 
     # Step 4: Fuzzy node resolution
     node_refs = []

@@ -116,7 +116,7 @@ def decide_resolve(
                 raise DecisionError("Failed to import cascade module (fleet_cascade.py not found)")
 
             try:
-                cascade_result = cascade(feature, decision_node, dry_run=False)
+                cascade_result = cascade(feature, decision_node, dry_run=False, lock_obj=lock_obj)
                 if cascade_result.get("error"):
                     # Mark descendants blocked on cascade error
                     for desc in descendants:

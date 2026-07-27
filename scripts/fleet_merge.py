@@ -155,8 +155,14 @@ def merge_back(
             if not node_tip_sha:
                 raise MergeError(f"Node {node} has no tip_sha")
 
-            if len(children) == 1:
-                # Single child: simple --onto
+            # Handle three cases based on child count
+            if len(children) == 0:
+                # Zero children (leaf node): archive only, no rebase needed
+                # Drop node's commits by not re-parenting anything
+                pass
+
+            elif len(children) == 1:
+                # Single child: simple --onto (existing working behavior)
                 child = children[0]
                 child_ghost = _get_node_ghost(manifest, child)
 
@@ -166,34 +172,44 @@ def merge_back(
                     text=True,
                     timeout=300
                 )
-            else:
-                # Multiple children: compute topological max tip for range
-                max_child = get_max_descendant(children, manifest, node)
-                max_ghost = _get_node_ghost(manifest, max_child)
-                max_tip_sha = subprocess.check_output(
-                    ["git", "rev-parse", max_ghost],
-                    stderr=subprocess.DEVNULL,
-                    text=True
-                ).strip()
 
+                if result.returncode != 0:
+                    # Inspect stderr to distinguish merge conflicts from other errors
+                    if _is_merge_conflict(result.stderr):
+                        raise ConflictError(result.stderr)
+                    else:
+                        raise MergeError(
+                            f"Git rebase failed: {result.stderr}"
+                        )
+
+            else:
+                # Multiple children: rebase each child individually with --update-refs
                 # WARNING: Incorrect endpoint selection would miss parallel children
                 # (C3 regression) or rewrite unintended commits. Verify git_depth_in_dag
                 # metric matches manifest DAG topology (not git history). Test with
                 # parallel-branch scenarios (T-M8) before deployment.
-                rebase_range = f"{node_tip_sha}^..{max_tip_sha}"
+                for child in children:
+                    child_ghost = _get_node_ghost(manifest, child)
 
-                result = subprocess.run(
-                    ["git", "rebase", "--onto", "main", rebase_range],
-                    capture_output=True,
-                    text=True,
-                    timeout=300
-                )
+                    result = subprocess.run(
+                        ["git", "rebase", "--update-refs", "--onto", "main",
+                         node_tip_sha, child_ghost],
+                        capture_output=True,
+                        text=True,
+                        timeout=300
+                    )
 
-            if result.returncode != 0:
-                raise ConflictError(result.stderr)
+                    if result.returncode != 0:
+                        # Inspect stderr to distinguish merge conflicts from other errors
+                        if _is_merge_conflict(result.stderr):
+                            raise ConflictError(result.stderr)
+                        else:
+                            raise MergeError(
+                                f"Git rebase failed for child {child}: {result.stderr}"
+                            )
 
         except ConflictError:
-            # Conflict detected; mark node blocked
+            # True merge conflict detected; mark node blocked
             node_obj["status"] = "blocked"
 
             try:
@@ -441,6 +457,29 @@ def handle_lease_fail(feature: str, node: str) -> Dict:
             "action": "user_resolves",
             "message": f"User must manually resolve {present_branch} on GitHub."
         }
+
+
+def _is_merge_conflict(stderr: str) -> bool:
+    """
+    Detect if git rebase stderr indicates a true merge conflict (private helper).
+
+    Distinguishes actual merge conflicts from other git rebase errors (invalid refs,
+    syntax errors, etc.). Used to correctly classify error as FLEET_011 (merge
+    conflict) vs. generic MergeError.
+
+    Args:
+        stderr: Git stderr output from rebase command
+
+    Returns:
+        bool: True if stderr indicates merge conflict, False for other errors
+    """
+    conflict_indicators = [
+        "CONFLICT",
+        "conflict",
+        "Merge conflict",
+        "merge conflict",
+    ]
+    return any(indicator in stderr for indicator in conflict_indicators)
 
 
 def _validate_topo_order(manifest: Dict, node: str) -> None:

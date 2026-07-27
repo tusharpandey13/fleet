@@ -31,7 +31,8 @@ class ConflictError(CascadeError):
 def cascade(
     feature: str,
     root_node: str,
-    dry_run: bool = False
+    dry_run: bool = False,
+    lock_obj: Optional[IO] = None
 ) -> Dict:
     """
     Cascade descendants via git rebase --update-refs.
@@ -43,6 +44,7 @@ def cascade(
         feature: Feature name
         root_node: Root node name (changed node whose descendants rebase onto it)
         dry_run: If True, print plan without executing
+        lock_obj: Optional lock object (if provided, use it; else acquire internally)
 
     Returns:
         Dict with {status, rebased, conflicts, parked_worktrees, error?, action?}
@@ -52,6 +54,7 @@ def cascade(
     """
     feature_path = os.path.expanduser(f"~/.fleet/{feature}")
     lock_path = os.path.join(feature_path, ".fleet.lock")
+    should_release = lock_obj is None
 
     # Step 1: Read manifest and reconcile
     try:
@@ -60,17 +63,23 @@ def cascade(
         raise CascadeError(f"Failed to read manifest: {e}")
 
     try:
-        manifest, unobserved_writes, divergences = reconcile(feature, manifest)
+        manifest, unobserved_writes, divergences = reconcile(feature, manifest, lock_obj=lock_obj)
     except ReconcileError as e:
         raise CascadeError(f"Reconciliation failed: {e}")
 
-    if divergences:
-        # Surface divergences to user; do not auto-fix
-        divergence_str = "; ".join([f"{d['node']}: {d['reason']}" for d in divergences])
-        raise CascadeError(f"DAG divergence detected: {divergence_str}. Manual fix required.")
-
     # Step 2: Topological sort of descendants
     descendants = topo_sort_descendants(manifest, root_node)
+
+    if divergences:
+        # Filter divergences: only abort for those OUTSIDE the cascade root's descendant set.
+        # Divergences of descendants are expected (stale-stack condition) and will be fixed by cascade.
+        unexpected_divergences = [
+            d for d in divergences if d['node'] not in descendants and d['node'] != root_node
+        ]
+        if unexpected_divergences:
+            # Surface unexpected divergences to user; do not auto-fix
+            divergence_str = "; ".join([f"{d['node']}: {d['reason']}" for d in unexpected_divergences])
+            raise CascadeError(f"DAG divergence detected: {divergence_str}. Manual fix required.")
     if not descendants:
         # No descendants to cascade
         return {
@@ -100,11 +109,12 @@ def cascade(
             if response != "yes":
                 return {"status": "cancelled"}
 
-    # Step 6: Acquire lock (wraps entire operation)
-    try:
-        lock_obj = acquire_lock(lock_path)
-    except LockTimeoutError as e:
-        raise CascadeError(f"Failed to acquire lock: {e}")
+    # Step 6: Acquire lock if not provided (wraps entire operation)
+    if lock_obj is None:
+        try:
+            lock_obj = acquire_lock(lock_path)
+        except LockTimeoutError as e:
+            raise CascadeError(f"Failed to acquire lock: {e}")
 
     try:
         # Step 7: WAL intent (pre-cascade state)
@@ -299,7 +309,8 @@ def cascade(
         }
 
     finally:
-        release_lock(lock_obj)
+        if should_release and lock_obj:
+            release_lock(lock_obj)
 
 
 def topo_sort_descendants(manifest: Dict, root_node: str) -> List[str]:
@@ -307,16 +318,19 @@ def topo_sort_descendants(manifest: Dict, root_node: str) -> List[str]:
     Topologically sort descendants of root_node.
 
     Returns list of descendant node names in topological order (BFS from root).
+    Deduplicates nodes that have multiple incoming edges (e.g., artifacts depending
+    on multiple parents).
 
     Args:
         manifest: Manifest dict with nodes and edges
         root_node: Root node name
 
     Returns:
-        List of descendant node names (topologically ordered)
+        List of descendant node names (topologically ordered, no duplicates)
     """
     nodes = manifest.get("nodes", {})
     descendants = []
+    descendants_set = set()
     visited = set()
     queue = [root_node]
 
@@ -334,13 +348,17 @@ def topo_sort_descendants(manifest: Dict, root_node: str) -> List[str]:
             # Feature stacking edge (base == current)
             if node.get("base") == current:
                 if node_name != root_node:  # Avoid including root itself
-                    descendants.append(node_name)
+                    if node_name not in descendants_set:
+                        descendants.append(node_name)
+                        descendants_set.add(node_name)
                     queue.append(node_name)
 
             # Artifact dependency edge (current in deps)
             elif node.get("kind") == "artifact" and current in node.get("deps", []):
                 if node_name != root_node:
-                    descendants.append(node_name)
+                    if node_name not in descendants_set:
+                        descendants.append(node_name)
+                        descendants_set.add(node_name)
                     queue.append(node_name)
 
     return descendants
@@ -371,9 +389,9 @@ def _find_parked_worktrees(descendants: List[str]) -> List[Tuple[str, str]]:
     """
     Find worktrees that need to be parked before cascade.
 
-    Scans git worktree list for branches matching descendants. Parked worktrees
-    are detached before cascade to prevent ref conflicts during --update-refs
-    rewriting, then re-attached after rebase completes.
+    Scans git worktree list (--porcelain format) for branches matching descendants.
+    Parked worktrees are detached before cascade to prevent ref conflicts during
+    --update-refs rewriting, then re-attached after rebase completes.
 
     Args:
         descendants: List of descendant node names (ghost branches)
@@ -383,30 +401,63 @@ def _find_parked_worktrees(descendants: List[str]) -> List[Tuple[str, str]]:
     """
     parked_wts = []
     try:
+        # Use --porcelain format for reliable parsing (modern git format with [ref])
         result = subprocess.run(
-            ["git", "worktree", "list"],
+            ["git", "worktree", "list", "--porcelain"],
             capture_output=True,
             text=True,
             timeout=5
         )
+        current_wt_path = None
         for line in result.stdout.strip().split("\n"):
             if not line:
                 continue
-            # Format: /path/to/wt SHA (branch/ref)
-            parts = line.split()
-            if len(parts) < 2:
-                continue
-            wt_path = parts[0]
-            # Extract branch from rest of line (between parens)
-            if "(" in line and ")" in line:
-                branch = line[line.index("(") + 1:line.index(")")].strip()
-                # Check if this branch is in descendants (as a ghost)
-                for desc in descendants:
-                    if branch.endswith(f"/{desc}") or branch == desc:
-                        parked_wts.append((wt_path, branch))
-                        break
+            # Porcelain format: "worktree /path" line, followed by "branch refs/heads/..."
+            if line.startswith("worktree "):
+                current_wt_path = line[9:].strip()
+            elif line.startswith("branch ") and current_wt_path:
+                # Format: "branch refs/heads/ghost/feature/branch"
+                branch_ref = line[7:].strip()  # Remove "branch "
+                # Extract branch name from refs/heads/...
+                if branch_ref.startswith("refs/heads/"):
+                    branch = branch_ref[11:]  # Remove "refs/heads/"
+                    # Check if this branch is in descendants (as a ghost)
+                    for desc in descendants:
+                        if branch.endswith(f"/{desc}") or branch == desc:
+                            parked_wts.append((current_wt_path, branch))
+                            break
     except Exception:
-        pass
+        # Fallback to legacy format parsing if --porcelain fails
+        try:
+            result = subprocess.run(
+                ["git", "worktree", "list"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            for line in result.stdout.strip().split("\n"):
+                if not line:
+                    continue
+                # Legacy format: /path/to/wt SHA (branch/ref) or /path/to/wt SHA [branch/ref]
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                wt_path = parts[0]
+                # Extract branch from square brackets (modern) or parens (legacy)
+                branch = None
+                if "[" in line and "]" in line:
+                    branch = line[line.index("[") + 1:line.index("]")].strip()
+                elif "(" in line and ")" in line:
+                    branch = line[line.index("(") + 1:line.index(")")].strip()
+
+                if branch:
+                    # Check if this branch is in descendants (as a ghost)
+                    for desc in descendants:
+                        if branch.endswith(f"/{desc}") or branch == desc:
+                            parked_wts.append((wt_path, branch))
+                            break
+        except Exception:
+            pass
     return parked_wts
 
 

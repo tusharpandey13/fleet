@@ -132,13 +132,10 @@ def reconcile(
             node["range"]["base_sha"] = live_base_sha
 
             # Step 2: Check effective base (DAG consistency)
-            # Get parent commit of ghost tip: ~1 is parent commit
-            try:
-                git_parent_sha = _git_rev_parse(f"{ghost_branch}~1")
-            except Exception:
-                git_parent_sha = None
-
-            # For divergence check: if base_branch is another node, resolve to its tip
+            # Compare merge-base (true base after any rebases) against manifest base.
+            # live_base_sha was already computed above; use it for comparison.
+            # The manifest_base is the expected base per the DAG (either base_ref tip
+            # for stacked features, or main for root nodes).
             if base_branch and base_branch in nodes:
                 base_node = nodes.get(base_branch, {})
                 manifest_base_sha = base_node.get("range", {}).get("tip_sha")
@@ -146,11 +143,12 @@ def reconcile(
                 # Root node; base is main
                 manifest_base_sha = node["range"]["base_sha"]
 
-            if git_parent_sha and manifest_base_sha and git_parent_sha != manifest_base_sha:
+            # live_base_sha is the actual merge-base; compare against expected manifest base
+            if live_base_sha and manifest_base_sha and live_base_sha != manifest_base_sha:
                 divergences.append({
                     "node": node_name,
                     "reason": "git parent ≠ manifest base",
-                    "git_parent": git_parent_sha,
+                    "git_parent": live_base_sha,
                     "manifest_base": manifest_base_sha
                 })
 
@@ -162,7 +160,7 @@ def reconcile(
             if node.get("kind") != "artifact":
                 continue
 
-            # Check if any dep has changed
+            # Check if any dep has changed since last reconcile snapshot
             stale = False
             for dep in node.get("deps", []):
                 live_dep_sha = nodes.get(dep, {}).get("range", {}).get("tip_sha")
@@ -171,15 +169,28 @@ def reconcile(
                     stale = True
                     break
 
-            node["stale"] = stale
-
-            # Update deps_sha snapshot
-            deps_sha = {}
-            for dep in node.get("deps", []):
-                dep_sha = nodes.get(dep, {}).get("range", {}).get("tip_sha")
-                if dep_sha:
-                    deps_sha[dep] = dep_sha
-            node["deps_sha"] = deps_sha
+            # If stale is detected, mark it and update deps_sha snapshot on this pass.
+            # If already stale (from a prior reconcile), preserve stale=True unless
+            # deps_sha has been explicitly updated (by cascade/present during regeneration).
+            if stale:
+                node["stale"] = True
+                # Update deps_sha snapshot when staleness is detected
+                deps_sha = {}
+                for dep in node.get("deps", []):
+                    dep_sha = nodes.get(dep, {}).get("range", {}).get("tip_sha")
+                    if dep_sha:
+                        deps_sha[dep] = dep_sha
+                node["deps_sha"] = deps_sha
+            elif not node.get("stale", False):
+                # Only compute stale=False if it wasn't already stale;
+                # once stale, it stays stale until regeneration updates deps_sha externally.
+                # Update deps_sha only for non-stale artifacts (unchanged deps).
+                deps_sha = {}
+                for dep in node.get("deps", []):
+                    dep_sha = nodes.get(dep, {}).get("range", {}).get("tip_sha")
+                    if dep_sha:
+                        deps_sha[dep] = dep_sha
+                node["deps_sha"] = deps_sha
 
         # Step 4: Recompute presentation staleness
         for node_name, node in nodes.items():
