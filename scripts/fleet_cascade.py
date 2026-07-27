@@ -174,49 +174,93 @@ def cascade(
                 timeout=5
             )
 
-            # Compute rebase base. An explicit rebase_base_sha (e.g. the
-            # promoted option's ghost tip during decision re-parenting) takes
-            # precedence over the root node's own base. This is required for
-            # decision nodes, which have no git base_sha of their own.
-            if rebase_base_sha:
-                root_base_sha = rebase_base_sha
-            else:
-                root_node_obj = manifest.get("nodes", {}).get(root_node, {})
-                root_base_sha = root_node_obj.get("range", {}).get("base_sha")
-                if not root_base_sha:
-                    raise CascadeError(f"Root node {root_node} has no base_sha")
-
-            # Find max descendant (deepest topologically, tie-break by SHA)
-            max_desc = get_max_descendant(descendants, manifest, root_node)
-            max_ghost = _get_node_ghost(manifest, max_desc)
-            max_tip_sha = subprocess.check_output(
-                ["git", "rev-parse", max_ghost],
-                stderr=subprocess.DEVNULL,
-                text=True
-            ).strip()
-
-            # WARNING: Incorrect endpoint selection would miss parallel descendants
-            # (C2 regression) or rewrite unintended commits. Verify git_depth_in_dag
-            # metric matches manifest DAG topology (not git history). Test with
-            # parallel-branch scenarios (T-C3) before deployment.
+            # Per-node topological rebase (BUG-11 fix).
             #
-            # git rebase takes an <upstream> and a <branch> to rebase, NOT a
-            # commit range ("base^..tip" is rejected with "invalid upstream").
-            # Rebase the deepest descendant branch onto the root's base; the
-            # --update-refs flag rewrites the intermediate ghost refs (root and
-            # any parallel branches sharing the range) along the way. This is a
-            # no-op when the descendants are already based on root_base_sha
-            # (idempotent), and replays cleanly when the root has been rewritten.
-            result = subprocess.run(
-                ["git", "rebase", "--update-refs", root_base_sha, max_ghost],
-                capture_output=True,
-                text=True,
-                timeout=300
-            )
+            # The old implementation ran a single `git rebase --update-refs
+            # <root_base> <max_ghost>`, using the ROOT's *base* as the rebase
+            # upstream. Because the descendants are already based on that base,
+            # git treats it as a no-op (nothing to replay) — so the root's NEW
+            # commits never propagate into the descendant ancestry, yet cascade
+            # returned {"status":"success"}. Refs never moved.
+            #
+            # Correct approach mirrors the merge-back path (BUG-8): rebase each
+            # descendant onto its parent's NEW tip, off the parent's OLD tip,
+            # using discrete refs (never a `A..B` range). Process in topological
+            # order (parents before children) so each parent's ghost already
+            # points at its rebased tip when its children are processed.
+            #
+            # For each descendant N:
+            #   old_base = N.range.base_sha   (commit N currently sits on — the
+            #                                  reconciled merge-base, i.e. the
+            #                                  parent's OLD tip)
+            #   new_base = current git tip of N's parent ghost (already advanced:
+            #             the root was moved by the caller; deeper parents were
+            #             rebased earlier in this loop). For the root's direct
+            #             children a rebase_base_sha override (decision re-parent,
+            #             where the decision node has no ghost) takes precedence.
+            #   git rebase --update-refs --onto <new_base> <old_base> <N_ghost>
 
-            if result.returncode != 0:
-                # Conflict detected
-                raise ConflictError(result.stderr)
+            nodes_map = manifest.get("nodes", {})
+
+            # Snapshot each descendant's current (old) base before any rebase.
+            old_base_sha = {}
+            for node_name in descendants:
+                nb = nodes_map.get(node_name, {})
+                old_base_sha[node_name] = nb.get("range", {}).get("base_sha")
+
+            rebased_features = []
+            for node_name in descendants:  # topological order
+                node = nodes_map.get(node_name, {})
+                # Artifacts (and any node without a ghost) carry no git branch;
+                # they are handled by staleness marking below, not rebased.
+                if node.get("kind") == "artifact" or not node.get("ghost"):
+                    continue
+
+                node_ghost = _get_node_ghost(manifest, node_name)
+                parent = node.get("base")
+
+                # Resolve the parent's NEW tip (rebase target).
+                if parent == root_node and rebase_base_sha:
+                    # Decision re-parent: promoted option ghost tip.
+                    new_base = rebase_base_sha
+                else:
+                    parent_node = nodes_map.get(parent, {})
+                    parent_ghost = parent_node.get("ghost")
+                    if not parent_ghost:
+                        raise CascadeError(
+                            f"Cannot cascade {node_name}: parent {parent} has no ghost "
+                            f"and no rebase_base_sha override provided."
+                        )
+                    new_base = subprocess.check_output(
+                        ["git", "rev-parse", parent_ghost],
+                        stderr=subprocess.DEVNULL,
+                        text=True
+                    ).strip()
+
+                old_base = old_base_sha.get(node_name)
+                if not old_base:
+                    raise CascadeError(f"Node {node_name} has no base_sha to rebase from")
+
+                # Idempotent skip: descendant already sits on the new base.
+                if old_base == new_base:
+                    rebased_features.append(node_name)
+                    continue
+
+                result = subprocess.run(
+                    ["git", "rebase", "--update-refs", "--onto",
+                     new_base, old_base, node_ghost],
+                    capture_output=True,
+                    text=True,
+                    timeout=300
+                )
+
+                if result.returncode != 0:
+                    # Distinguish a real merge conflict from other git errors.
+                    subprocess.run(["git", "rebase", "--abort"],
+                                   capture_output=True, timeout=30)
+                    raise ConflictError(result.stderr)
+
+                rebased_features.append(node_name)
 
         except ConflictError:
             # Rebase halted due to conflict; mark affected nodes blocked
