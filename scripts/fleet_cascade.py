@@ -239,7 +239,26 @@ def cascade(
 
                 old_base = old_base_sha.get(node_name)
                 if not old_base:
-                    raise CascadeError(f"Node {node_name} has no base_sha to rebase from")
+                    # BUG-24: If this node is a descendant of a decision node and its
+                    # base_sha is None (because decision node has no top-level ghost to
+                    # merge-base against), compute old_base by finding the merge-base
+                    # between this node's ghost and the promoted option.
+                    if parent == root_node and rebase_base_sha:
+                        try:
+                            # Compute where this branch currently sits relative to the
+                            # promoted option. This gives us the true base of the branch.
+                            old_base = subprocess.check_output(
+                                ["git", "merge-base", node_ghost, rebase_base_sha],
+                                stderr=subprocess.DEVNULL,
+                                text=True
+                            ).strip()
+                        except subprocess.CalledProcessError:
+                            raise CascadeError(
+                                f"Cannot compute base for decision descendant {node_name}: "
+                                f"merge-base failed between {node_ghost} and {rebase_base_sha}"
+                            )
+                    else:
+                        raise CascadeError(f"Node {node_name} has no base_sha to rebase from")
 
                 # Idempotent skip: descendant already sits on the new base.
                 if old_base == new_base:
