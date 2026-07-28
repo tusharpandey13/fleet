@@ -16,20 +16,23 @@ Every destructive operation is gated by a dry-run preview and confirmation. Flee
 
 ## CLI surface
 
-Fleet exposes eight subcommands. Invoke via `python scripts/fleet.py <command>` (shown below as `fleet` for brevity):
+Fleet exposes 13 subcommands. Invoke via `python scripts/fleet.py <command>` (shown below as `fleet` for brevity):
 
 | Command | Args | Purpose |
 |---------|------|---------|
-| `init` | `--feature` | Scaffold the feature directory |
-| `status` | `--feature` `[--json]` | Render the DAG and node states (reconciles first) |
+| `init` | `--feature` `[--json]` | Scaffold the feature directory and write manifest |
+| `plan` | `--feature` `--nodes <specs>` `\|` `--from-spec-file <file>` `[--dry-run]` `[--json]` | Create/update manifest DAG |
+| `materialize` | `--feature` `[--dry-run]` `[--json]` | Create ghost branches for all nodes |
+| `work` | `--feature` `--node` `[--json]` | Allocate worktree for a node |
 | `cascade` | `--feature` `--node` `[--dry-run]` | Rebase descendants of a node |
 | `merge` | `--feature` `--node` `[--mode individual\|batch]` `[--dry-run]` | Squash-cleanup a node onto `main` |
 | `publish` | `--feature` `--node` `[--dry-run]` | Build a presentation branch and open/update a PR |
+| `resolve` | `--feature` `--decision` `--option` `[--dry-run]` `[--json]` | Resolve decision node (experimental; requires FLEET_EXPERIMENTAL=1) |
+| `refresh` | `--feature` `--artifact` `[--json]` | Refresh artifact by running hook |
+| `status` | `--feature` `[--json]` | Render the DAG and node states (reconciles first) |
 | `reconcile` | `--feature` `[--json]` | Recompute manifest derivables from git |
 | `classify` | `<utterance>` `[--feature]` `[--json]` | Map a natural-language phrase to an intent |
 | `dryrun` | `--feature` `--intent` `[--nodes ...]` `[--json]` | Preview an operation's impact |
-
-> **Authoring the graph:** `init` currently scaffolds the feature directory only — it does not populate nodes. Seed the node graph by writing `~/.fleet/<feature>/manifest.yaml` directly (schema in [references/MANIFEST-FORMAT.md](./references/MANIFEST-FORMAT.md)). The higher-level `plan` / `materialize` / `work` intents described in [SKILL.md](./SKILL.md) are part of the natural-language spec and are not yet wired as subcommands.
 
 ---
 
@@ -41,11 +44,18 @@ Fleet exposes eight subcommands. Invoke via `python scripts/fleet.py <command>` 
 fleet init --feature payments
 ```
 
-Scaffolds the feature workspace under `~/.fleet/payments/`. Next, author the graph in the manifest.
+Scaffolds the feature workspace under `~/.fleet/payments/` and writes a minimal manifest with an empty node graph.
 
-### 2. Author the manifest
+### 2. Plan the DAG
 
-Write `~/.fleet/payments/manifest.yaml` to define a three-node stack (`a1 → a2 → a3`):
+Define a three-node stack (`a1 → a2 → a3`) using the `plan` subcommand:
+
+```bash
+fleet plan --feature payments \
+  --nodes "a1:feature" "a2:feature(a1)" "a3:feature(a2)"
+```
+
+Or author `~/.fleet/payments/manifest.yaml` directly (schema in [references/MANIFEST-FORMAT.md](./references/MANIFEST-FORMAT.md)):
 
 ```yaml
 feature: payments
@@ -76,11 +86,17 @@ nodes:
     status: draft
 ```
 
-The `range.base_sha` / `range.tip_sha` fields are derivable — `reconcile` and `status` fill them from live git refs. You do not set them by hand.
+The `range.base_sha` / `range.tip_sha` fields are derivable — `reconcile` and `status` fill them from live git refs.
 
-### 3. Create the ghost branches
+### 3. Materialize the ghost branches
 
-Fleet reads ghost branch names from the manifest. Create them from `main` with git so the nodes are materialized:
+Create ghost branches from `main` with a single command:
+
+```bash
+fleet materialize --feature payments
+```
+
+Or create them manually with git:
 
 ```bash
 git branch ghost/payments/a1 main
@@ -299,9 +315,9 @@ DRY-RUN: Resolve decision node
   Available options: optA, optB
 ```
 
-The `dryrun` subcommand lists the options for a decision node. When resolution executes (through the natural-language interface, which supplies the chosen option), the losing option is archived, descendants re-parent onto the winner, and any node whose `assumes` option lost is flagged `needs-rework` with a rebuild contract derived from its `assumes.on_flip` strategy.
+The `dryrun` subcommand lists the options for a decision node. When resolution executes (e.g., via `fleet resolve --feature db --decision orm_choice --option optA`), the losing option is archived, descendants re-parent onto the winner, and any node whose `assumes` option lost is flagged `needs-rework` with a rebuild contract derived from its `assumes.on_flip` strategy.
 
-> Decision resolution requires `experimental: true` in the manifest.
+> Decision resolution requires the experimental gate enabled: either `export FLEET_EXPERIMENTAL=1` before running `fleet resolve`, or set `experimental: true` in the manifest. Without it, you'll see error FLEET_099.
 
 ### Handle conflicts
 

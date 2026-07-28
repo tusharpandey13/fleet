@@ -27,7 +27,6 @@
 | Code | Description | Recovery | Tests |
 |------|-------------|----------|-------|
 | **FLEET_030** | Lock timeout; another process holding lock >30min | Wait for other process to finish, or kill stale holder and retry | T-W2 |
-| **FLEET_031** | Lock held by another process (transient) | Retry after process releases lock (automatic backoff) | Implicit (integration tests) |
 
 ### Worktree Pool (FLEET_040–FLEET_049)
 
@@ -47,14 +46,12 @@
 | Code | Description | Recovery | Tests |
 |------|-------------|----------|-------|
 | **FLEET_060** | Node not found or invalid kind for operation | Verify node name is correct; check manifest nodes | Implicit (unit tests) |
-| **FLEET_061** | DAG divergence detected; git parent ≠ manifest base | Realign manifest or rebase git refs to match manifest; reconcile | T-R2 |
 
-### NLI & Intent (FLEET_070–FLEET_079)
+### Experimental (FLEET_099)
 
 | Code | Description | Recovery | Tests |
 |------|-------------|----------|-------|
-| **FLEET_070** | Low confidence for destructive op; requires confirmation | Re-phrase utterance or manually specify node/option; confirm action | T-N3, T-E2 |
-| **FLEET_071** | Fuzzy node match ambiguous; multiple nodes matched | List candidates; user selects which node; retry | T-N3 |
+| **FLEET_099** | Experimental feature not enabled; `fleet resolve` (decision-variant resolution) requires explicit opt-in | Enable either (1) `export FLEET_EXPERIMENTAL=1` before running `fleet resolve`, OR (2) set `experimental: true` in the manifest (top-level field). Then retry the command. | T-Res-2 |
 
 ---
 
@@ -167,53 +164,6 @@ if any(n.status != 'archived' for n in prior_nodes):
     return {error: "Cannot merge before dependencies"}
 ```
 
-### DAG Divergence (FLEET_061)
-
-**When:**
-- Reconcile detects git parent ≠ manifest base
-
-**Handling:**
-```python
-if git_parent_sha != manifest_base_sha:
-    divergences.append({
-        node: node_name,
-        reason: "git parent ≠ manifest base",
-        git_parent: git_parent_sha,
-        manifest_base: manifest_base_sha
-    })
-    print("FLEET_061: DAG divergence detected")
-    print(f"Node {node_name}: manual realignment required")
-```
-
-### Low-Confidence NLI (FLEET_070)
-
-**When:**
-- NLI detects destructive intent with confidence <0.7
-
-**Handling:**
-```python
-if intent in ['COMMIT', 'MERGE', 'RESOLVE_DECISION'] and confidence < 0.7:
-    print(f"FLEET_070: Low confidence ({confidence}) for {intent}")
-    confirm = prompt_user("Proceed? (yes/no): ")
-    if confirm != 'yes':
-        return {error: "Cancelled due to low confidence"}
-```
-
-### Ambiguous Fuzzy Match (FLEET_071)
-
-**When:**
-- Fuzzy node resolution returns multiple matches
-
-**Handling:**
-```python
-if len(matches) > 1:
-    print("FLEET_071: Ambiguous node match:")
-    for i, m in enumerate(matches):
-        print(f"  ({i+1}) {m.desc} [{m.ghost}]")
-    choice = prompt_user("Select (1-N): ")
-    selected = matches[int(choice) - 1]
-```
-
 ---
 
 ## Testing Strategy
@@ -222,19 +172,16 @@ Each error code has associated test case(s) in the test matrix:
 
 - **FLEET_001:** T-R1 (manifest not found)
 - **FLEET_002:** T-R2 (cycle detection), T-C1 (DAG validation)
-- **FLEET_003:** T-R1 (schema validation)
+- **FLEET_003:** T-R1, T-R5 (schema validation)
 - **FLEET_010:** T-C4 (conflict during cascade)
 - **FLEET_011:** T-M2 (conflict during merge-back)
 - **FLEET_020:** T-P5, T-E1 (lease fail handling)
 - **FLEET_030:** T-W2 (lock timeout during WAL recovery)
-- **FLEET_031:** Implicit (automatic backoff)
 - **FLEET_040:** T-C6 (dirty worktree during cascade)
 - **FLEET_041:** T-E4 (worktree pool full)
 - **FLEET_050:** T-M3 (out-of-order merge)
 - **FLEET_060:** Implicit (node validation)
-- **FLEET_061:** T-R2 (DAG divergence)
-- **FLEET_070:** T-N3, T-E2 (low-confidence NLI)
-- **FLEET_071:** T-N3 (ambiguous fuzzy match)
+- **FLEET_099:** T-Res-2 (experimental gate for `fleet resolve`)
 
 ---
 
@@ -246,8 +193,8 @@ Each error code has associated test case(s) in the test matrix:
 - **FLEET_040–FLEET_049:** Worktree pool
 - **FLEET_050–FLEET_059:** Merge operations
 - **FLEET_060–FLEET_069:** Node & DAG
-- **FLEET_070–FLEET_079:** NLI & intent
-- **FLEET_080+:** Future use
+- **FLEET_070–FLEET_098:** Reserved for future use
+- **FLEET_099:** Experimental-feature gate
 
 ---
 

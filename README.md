@@ -62,9 +62,7 @@ fleet merge --feature payments --node a1
 fleet status --feature payments
 ```
 
-The graph itself lives in `~/.fleet/<feature>/manifest.yaml` (see [references/MANIFEST-FORMAT.md](./references/MANIFEST-FORMAT.md)). `fleet init` scaffolds the feature directory; seed the node graph in the manifest before running graph operations. See [EXAMPLES.md](./EXAMPLES.md) for full walkthroughs including decision variants, conflict recovery, and force-push lease handling.
-
-> **Status:** the graph-authoring intents (plan / materialize / work) are defined in the [skill spec](./SKILL.md) and reachable through the natural-language interface, but are not yet exposed as direct subcommands. The working CLI surface is the eight subcommands listed under [Commands](#commands).
+The graph itself lives in `~/.fleet/<feature>/manifest.yaml` (see [references/MANIFEST-FORMAT.md](./references/MANIFEST-FORMAT.md)). `fleet init` scaffolds the feature directory; define the node graph via `fleet plan`, then run `fleet materialize` to create ghost branches. See [EXAMPLES.md](./EXAMPLES.md) for full walkthroughs including decision variants, conflict recovery, and force-push lease handling.
 
 ---
 
@@ -130,16 +128,21 @@ stateDiagram-v2
 
 | Command | Purpose | Safety |
 |---------|---------|--------|
-| `init` | Initialize a feature | Safe |
-| `status` | Render the DAG and node states | Read-only |
+| `init` | Initialize a feature (scaffold manifest, lock, worktree pool) | Safe |
+| `plan` | Create/update manifest DAG from specification | Safe |
+| `materialize` | Create ghost branches for all nodes | Safe (idempotent) |
+| `work` | Allocate worktree for a node | Safe |
 | `cascade` | Rebase descendants of a node | Destructive · dry-run + confirm |
 | `merge` | Squash a node onto `main`, re-parent children | Destructive · dry-run + confirm |
 | `publish` | Build a presentation branch and open/update a PR | Destructive · force-push with lease |
+| `resolve` | Resolve decision node by promoting an option | Destructive · experimental gate required (FLEET_099) |
+| `refresh` | Refresh artifact by running hook | Safe |
+| `status` | Render the DAG and node states | Read-only |
 | `reconcile` | Recompute manifest derivables from git | Read-only |
 | `dryrun` | Preview any operation's impact | Read-only |
 | `classify` | Map a natural-language phrase to an intent | Read-only |
 
-Fleet also accepts natural-language phrasing (e.g. *"merge a1 back to main"*), classified into one of eleven intents. Low-confidence or ambiguous phrasing triggers an explicit confirmation prompt before anything destructive runs.
+All commands accept `--json` for machine output; destructive commands support `--dry-run` preview. Natural-language classification is provided via `classify` and (in skill contexts) through the NLI layer.
 
 ---
 

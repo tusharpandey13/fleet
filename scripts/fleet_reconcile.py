@@ -121,7 +121,12 @@ def reconcile(
                     except Exception:
                         live_base_sha = None
                 else:
-                    live_base_sha = None
+                    # Base node has no ghost branch (e.g. a decision node). There is
+                    # no branch to merge-base against, so preserve the existing cached
+                    # base_sha rather than clobbering it to None — it holds the tip of
+                    # the option the descendant was built on and is needed by cascade's
+                    # decision re-parent (rebase --onto <promoted> <old_base>).
+                    live_base_sha = node.get("range", {}).get("base_sha")
             else:
                 # Root node; base is main
                 try:

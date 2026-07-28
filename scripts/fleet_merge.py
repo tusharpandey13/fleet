@@ -10,12 +10,13 @@ Wraps entire operation in lock + WAL intent/commit for crash recovery.
 
 import os
 import subprocess
-from typing import Dict, List, Optional, IO
+from typing import Dict, List, Optional, IO, Tuple
 from fleet_manifest import manifest_read, manifest_write_atomic, ManifestError
 from fleet_wal import wal_write, WALError
 from fleet_lock import acquire_lock, release_lock, git_depth_in_dag, get_max_descendant, LockTimeoutError
 from fleet_reconcile import reconcile, ReconcileError
-from fleet_cascade import cascade, topo_sort_descendants
+from fleet_cascade import cascade, topo_sort_descendants, _find_parked_worktrees
+from fleet_worktree import worktree_is_dirty, WorktreeDirtyError
 
 
 class MergeError(Exception):
@@ -96,6 +97,35 @@ def merge_back(
             # Lease failed; prompt user (incorporate/discard/manual)
             return handle_lease_fail(feature, node)
 
+    # Step 4b: Preflight worktree guard (BUG-16/FR-V2-8)
+    # Before lock acquire, mirror cascade's preflight: find parked worktrees for
+    # children/descendants in merge path. If any dirty → raise FLEET_040 and abort
+    # BEFORE any git rewrite. Park (detach) clean ones before rebase to prevent
+    # ref conflicts during --onto rewriting.
+    try:
+        parked_wts = _find_parked_worktrees(children)
+    except Exception as e:
+        raise MergeError(f"Failed to find parked worktrees: {e}")
+
+    for wt_path, branch in parked_wts:
+        if worktree_is_dirty(wt_path):
+            raise MergeError(
+                f"FLEET_040: Worktree {wt_path} has uncommitted changes; "
+                f"cannot merge-back. Commit or stash changes and retry."
+            )
+
+    # Park (detach) clean worktrees before rebase
+    for wt_path, branch in parked_wts:
+        try:
+            subprocess.run(
+                ["git", "-C", wt_path, "switch", "--detach", "HEAD"],
+                check=True,
+                capture_output=True,
+                timeout=10
+            )
+        except subprocess.CalledProcessError as e:
+            raise MergeError(f"Failed to park worktree {wt_path}: {e}")
+
     # Step 5: Acquire lock (wraps entire operation)
     try:
         lock_obj = acquire_lock(lock_path)
@@ -155,15 +185,22 @@ def merge_back(
             if not node_tip_sha:
                 raise MergeError(f"Node {node} has no tip_sha")
 
-            # Handle three cases based on child count
-            if len(children) == 0:
-                # Zero children (leaf node): archive only, no rebase needed
+            # Filter out artifacts from rebase set (BUG-15/FR-V2-8):
+            # Artifacts have no ghost branches → rebase fatal. Mark stale, do not rebase.
+            rebaseable_children = [
+                c for c in children
+                if manifest.get("nodes", {}).get(c, {}).get("kind") != "artifact"
+            ]
+
+            # Handle three cases based on rebaseable child count
+            if len(rebaseable_children) == 0:
+                # Zero rebaseable children (leaf node or all artifacts): archive only, no rebase needed
                 # Drop node's commits by not re-parenting anything
                 pass
 
-            elif len(children) == 1:
-                # Single child: simple --onto (existing working behavior)
-                child = children[0]
+            elif len(rebaseable_children) == 1:
+                # Single rebaseable child: simple --onto (existing working behavior)
+                child = rebaseable_children[0]
                 child_ghost = _get_node_ghost(manifest, child)
 
                 result = subprocess.run(
@@ -183,12 +220,12 @@ def merge_back(
                         )
 
             else:
-                # Multiple children: rebase each child individually with --update-refs
+                # Multiple rebaseable children: rebase each child individually with --update-refs
                 # WARNING: Incorrect endpoint selection would miss parallel children
                 # (C3 regression) or rewrite unintended commits. Verify git_depth_in_dag
                 # metric matches manifest DAG topology (not git history). Test with
                 # parallel-branch scenarios (T-M8) before deployment.
-                for child in children:
+                for child in rebaseable_children:
                     child_ghost = _get_node_ghost(manifest, child)
 
                     result = subprocess.run(
@@ -241,8 +278,8 @@ def merge_back(
         node_obj["status"] = "archived"
         node_obj["present"] = None
 
-        # Step 9: Update children's base_sha (now points to main)
-        for child in children:
+        # Step 9: Update rebaseable children's base_sha (now points to main)
+        for child in rebaseable_children:
             child_obj = manifest.get("nodes", {}).get(child, {})
             if child_obj:
                 child_ghost = child_obj.get("ghost")
@@ -258,6 +295,50 @@ def merge_back(
                         child_obj["range"]["base_sha"] = live_base
                     except Exception:
                         pass
+
+        # Step 9b: Mark artifact descendants stale (BUG-15)
+        # Artifacts have no ghost branches; they are skipped in rebase above.
+        # Mark them stale and update deps_sha snapshot.
+        for node_name, node in manifest.get("nodes", {}).items():
+            if not isinstance(node, dict):
+                continue
+
+            if node.get("kind") != "artifact":
+                continue
+
+            # Check if artifact depends on the merged node or any rebased child
+            affected = False
+            if node.get("base") == node:
+                affected = True
+            else:
+                for dep in node.get("deps", []):
+                    if dep == node or dep in rebaseable_children:
+                        affected = True
+                        break
+
+            if affected:
+                node["stale"] = True
+                # Update deps_sha snapshot
+                deps_sha = {}
+                for dep in node.get("deps", []):
+                    dep_node = manifest.get("nodes", {}).get(dep, {})
+                    dep_tip = dep_node.get("range", {}).get("tip_sha")
+                    if dep_tip:
+                        deps_sha[dep] = dep_tip
+                node["deps_sha"] = deps_sha
+
+        # Step 9c: Re-attach parked worktrees (BUG-16)
+        # Mirror cascade's re-attach: switch worktrees back to their branches.
+        for wt_path, branch in parked_wts:
+            try:
+                subprocess.run(
+                    ["git", "-C", wt_path, "switch", branch],
+                    check=True,
+                    capture_output=True,
+                    timeout=10
+                )
+            except subprocess.CalledProcessError as e:
+                raise MergeError(f"Failed to re-attach worktree {wt_path}: {e}")
 
         # Step 10: WAL commit
         try:

@@ -27,7 +27,7 @@ teardown() { cleanup_sandbox; }
 @test "IT-E1: init runs (stub) without error" {
   run fleet_cli init --feature e2e
   [ "$status" -eq 0 ]
-  [[ "$output" =~ "Initialization complete" ]]
+  [[ "$output" =~ "Initialized fleet for feature" ]] || [[ "$output" =~ "already initialized" ]]
 }
 
 @test "IT-E7: status renders the DAG with all nodes" {

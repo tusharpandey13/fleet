@@ -1,14 +1,15 @@
-# Fleet — Multi-Node Branch Orchestration Skill
-
+---
+name: fleet
+description: Orchestrate complex multi-node git feature branches with deterministic cascade, squash cleanup, and presentation generation. Use when the user invokes /fleet or asks to plan, materialize, work on, cascade, resolve, merge-back, or publish stacked feature branches, decision variants, or artifacts.
+license: MIT
+metadata:
+  author: Fleet
+  version: "2.0"
 ---
 
-## Metadata
+# Fleet — Multi-Node Branch Orchestration Skill
 
-**name:** Fleet  
-**description:** Orchestrate complex multi-node git feature branches with deterministic cascade, squash cleanup, and presentation generation. Works with stacked features, decision variants, and artifacts.  
-**version:** 1.0 (Tier 4 implementation)  
-**triggers:** fleet, branch orchestration, cascade, merge-back, publish, decision resolve  
-**integration:** Git, GitHub CLI (gh), local manifest YAML, write-ahead log (WAL)  
+**Integration:** Git, GitHub CLI (gh), local manifest YAML, write-ahead log (WAL)
 
 ---
 
@@ -127,13 +128,13 @@ Example: *"Fix the cascade conflict"*
 Keywords: "decide", "resolve", "choose", "pick", "select"  
 Example: *"Resolve the database design decision on optA"*
 
-**Action:** (Experimental, gated by manifest flag.)
+**Action:** (Experimental, gated by `FLEET_EXPERIMENTAL=1` env or `manifest.experimental: true`.)
 - Promote chosen option (archive losing branches).
 - Re-parent descendants onto chosen ghost.
 - For each assuming node: emit rebuild contract prompt if assumption lost.
 - Cascade to propagate re-parenting.
 
-**Safety:** **Destructive.** Experimental (T-D1..T-D7). Requires decision node + clear option choice.
+**Safety:** **Destructive.** Experimental (T-D1..T-D7). Requires decision node + clear option choice + experimental gate enabled.
 
 ---
 
@@ -319,8 +320,8 @@ Fleet uses error codes (FLEET_NNN) for deterministic recovery guidance.
 
 #### **FLEET_099: Decision resolution not enabled**
 **Cause:** `RESOLVE_DECISION` attempted without the experimental gate.  
-**Recovery:** Set top-level `experimental: true` in the manifest, then retry.  
-**Source:** `fleet_decision.py` (`decide_resolve`).
+**Recovery:** Enable the experimental gate via either (1) `export FLEET_EXPERIMENTAL=1` before running `fleet resolve`, or (2) set `experimental: true` in the manifest. Then retry.  
+**Source:** `fleet_decision.py` (`decide_resolve`), `fleet.py` (`cmd_resolve`).
 
 ---
 
@@ -483,28 +484,34 @@ All operations are **idempotent**:
 
 ## Examples
 
-> **Real CLI surface.** `fleet` exposes exactly these subcommands:
-> `init` (stub — prints only, writes nothing), `status`, `cascade`, `merge`,
-> `publish`, `reconcile`, `classify`, `dryrun`. There is **no** `fleet plan`,
-> `materialize`, `work`, `assume`, `resolve`, or `commit` subcommand. Those
-> intents map to manifest edits + git + the module scripts below:
-> - **RESOLVE_DECISION** → `python scripts/fleet_decision.py <feature> <decision> <option>` (experimental)
-> - **PUBLISH** → `fleet publish …` OR `python scripts/fleet_present.py <feature> <node>`
-> - **WORK / is-dirty** → `python scripts/fleet_worktree.py <feature> is-dirty <path>`
-> - **PLAN / MATERIALIZE / assume / artifact-refresh** → edit the manifest + git branch, then `fleet reconcile`.
-> Every `fleet` command must run with **cwd = the repo clone** (modules operate on
-> the process cwd; the manifest `repo:` field is not read for main git ops).
+> **Real CLI surface.** `fleet` exposes 13 subcommands:
+> `init` (writes the manifest, lock, and worktree-pool dir), `plan`, `materialize`, `work`, `resolve`, `refresh`, `status`, `cascade`, `merge`, `publish`, `reconcile`, `classify`, `dryrun`.
+>
+> **Intent mapping:**
+> - **PLAN** → `fleet plan --feature <f> --nodes "a1:feature" "a2:feature(a1)" …` (or `--from-spec-file <file>`)
+> - **MATERIALIZE** → `fleet materialize --feature <f>` (creates ghost branches, wires edges; idempotent)
+> - **WORK** → `fleet work --feature <f> --node <n>` (allocates a worktree, prints its path)
+> - **RESOLVE_DECISION** → `fleet resolve --feature <f> --decision <d> --option <opt>` (experimental; needs `export FLEET_EXPERIMENTAL=1` or manifest `experimental: true`, else FLEET_099)
+> - **ARTIFACT_REFRESH** → `fleet refresh --feature <f> --artifact <a>` (runs hook, clears stale, snapshots deps_sha)
+> - **COMMIT** intent → `fleet cascade --feature <f> --node <n> [--dry-run]` (rebase descendants onto a moved base)
+> - **PUBLISH** → `fleet publish --feature <f> --node <n> [--dry-run]` (force-push + PR; surfaces lease-fail recovery)
+> - **STATUS** → `fleet status --feature <f>` (reconciles, renders DAG)
+> - **DRYRUN** → `fleet dryrun --feature <f> --intent <INTENT> [--nodes ...]` (preview-only)
+> - **MERGE** → `fleet merge --feature <f> --node <n> [--mode {individual,batch}] [--dry-run]`
+> - **RECONCILE** → `fleet reconcile --feature <f>` (recomputes derivables from git)
+> - **CLASSIFY** → `fleet classify "<utterance>" [--feature <f>]` (NLI intent classification)
+>
+> Most commands accept `--json` for machine output and `--dry-run` where a preview is meaningful.
+> Every `fleet` command must run with **cwd = the repo clone** (modules operate on the process cwd; the manifest `repo:` field is not read for main git ops).
 
 ### Scenario 1: Stack 3 nodes, cascade when base changes
 
 ```bash
-# PLAN + MATERIALIZE: seed the manifest, then create ghost branches by hand.
-# (init is a stub; write the manifest via manifest_write_atomic, or edit YAML.)
-#   ~/.fleet/auth/manifest.yaml  with nodes a1, a2(base=a1), a3(base=a2)
-git branch ghost/auth/a1 main
-git branch ghost/auth/a2 ghost/auth/a1
-git branch ghost/auth/a3 ghost/auth/a2
-# ... commit work onto each ghost branch ...
+# INIT + PLAN + MATERIALIZE: create the manifest, define the DAG, build ghosts.
+fleet init --feature auth
+fleet plan --feature auth --nodes "a1:feature" "a2:feature(a1)" "a3:feature(a2)"
+fleet materialize --feature auth      # creates ghost/auth/a1..a3 from main, wires edges
+# ... commit work onto each ghost branch (fleet work --feature auth --node a1 → worktree path) ...
 fleet reconcile --feature auth        # fills range.base_sha / tip_sha
 
 # COMMIT intent = cascade. Preview, then execute.
@@ -525,15 +532,22 @@ fleet publish --feature auth --node a2
 ### Scenario 2: Decision branching
 
 ```bash
-# PLAN a decision node d1 with options optA/optB in the manifest; set
-# top-level `experimental: true` (else FLEET_099). MATERIALIZE option ghosts.
-git branch ghost/db/optA main
-git branch ghost/db/optB main
+# PLAN a decision node d1 with options optA/optB; enable experimental gate.
+# MATERIALIZE option ghosts; then WORK on options.
+export FLEET_EXPERIMENTAL=1
+fleet plan --feature db --nodes "d1:decision" "optA:option(d1)" "optB:option(d1)"
+fleet materialize --feature db
+fleet work --feature db --node optA     # allocate worktree for optA
 # Record an assumption on a dependent node by editing the manifest:
 #   nodes.a1.assumes.d1 = {option: optA, on_flip: rebuild}
 
-# RESOLVE_DECISION is a module script (no `fleet resolve` subcommand):
-python scripts/fleet_decision.py db d1 optB
+# Preview the resolution plan without executing any git rewrite:
+fleet resolve --feature db --decision d1 --option optB --dry-run
+
+# RESOLVE_DECISION: resolve a decision node to one option.
+# The experimental gate is required (env var OR manifest).
+export FLEET_EXPERIMENTAL=1
+fleet resolve --feature db --decision d1 --option optB
 # ✓ optB promoted; optA archived (renamed archive/…); descendants re-parented
 #   onto optB via cascade; assuming nodes emit a rebuild-contract prompt.
 ```
@@ -559,8 +573,8 @@ fleet merge --feature auth --node a2
 
 ## Troubleshooting
 
-### "Manifest not found"
-→ Seed `~/.fleet/<feature>/manifest.yaml` (via `manifest_write_atomic` or by hand). `fleet init` is a stub and does not create it. There is no FLEET_001.
+### "Manifest not found" (FLEET_001)
+→ Run `fleet init --feature <feature>` to create `~/.fleet/<feature>/manifest.yaml`, the lock file, and the worktree-pool dir, then `fleet plan …` to define the DAG.
 
 ### "DAG has a cycle" (FLEET_002)
 → A `base`/`deps` edge forms a loop. Fix the offending edge so the DAG is acyclic. (A rebase *divergence* is different — reconcile reports it as a non-fatal note, no code.)
@@ -604,7 +618,7 @@ A: Reconcile detects the unobserved write, flags it, and updates manifest. No da
 A: No; fleet is single-writer (lock-guarded). Multiple people on same feature → manual coordination or fork separate features.
 
 **Q: How do I recover from a crash?**  
-A: Startup checks for incomplete WAL entries (unpaired intent/commit) and prompts: replay (idempotent re-execute) or rollback (restore pre-images).
+A: Before any destructive subcommand (cascade, merge, publish, resolve, refresh, materialize), fleet checks for incomplete WAL entries (unpaired intent/commit) and prompts: replay (idempotent re-execute) or rollback (restore pre-images).
 
 **Q: Is there a GUI?**  
 A: Not yet. Fleet is CLI-only. This skill provides NL interface via utterance classification.

@@ -33,7 +33,8 @@ class ExperimentalGateError(DecisionError):
 def decide_resolve(
     feature: str,
     decision_node: str,
-    chosen_option: str
+    chosen_option: str,
+    dry_run: bool = False
 ) -> Dict:
     """
     Resolve decision node by promoting chosen option and re-parenting descendants.
@@ -49,15 +50,19 @@ def decide_resolve(
         feature: Feature name
         decision_node: Decision node name to resolve
         chosen_option: Option name to promote (must exist in decision.options)
+        dry_run: If True, compute and return plan preview without executing
+                 git rebases, branch archival, cascade, or manifest writes.
+                 Defaults to False (full execution).
 
     Returns:
-        Dict with {status, promoted, archived, rebuild_prompts} or error
+        Dict with {status, promoted, archived, rebuild_prompts} or error.
+        When dry_run=True, includes plan_preview describing planned actions.
 
     Raises:
         DecisionError: Operation failed
         ExperimentalGateError: Experimental not enabled in manifest
-        ManifestError: Manifest read/write failed
-        WALError: WAL write failed
+        ManifestError: Manifest read/write failed (only when dry_run=False)
+        WALError: WAL write failed (only when dry_run=False)
     """
     # Acquire lock for entire operation
     feature_path = os.path.expanduser(f"~/.fleet/{feature}")
@@ -75,10 +80,12 @@ def decide_resolve(
             raise DecisionError(f"Failed to read manifest: {e}")
 
         # Step 2: Check experimental gating
-        if not manifest.get("experimental", False):
+        experimental = manifest.get("experimental", False)
+        experimental_env = os.environ.get("FLEET_EXPERIMENTAL", "0") == "1"
+        if not (experimental or experimental_env):
             raise ExperimentalGateError(
                 "FLEET_099: Decision node resolution is experimental and not enabled. "
-                "Set 'experimental: true' in manifest to use this feature."
+                "Set 'experimental: true' in manifest or export FLEET_EXPERIMENTAL=1 to use this feature."
             )
 
         # Step 3: Validate decision node
@@ -107,6 +114,13 @@ def decide_resolve(
 
         # Step 6: Re-parent descendants onto promoted option (via cascade)
         descendants = _topo_sort_descendants(manifest, decision_node)
+        plan_preview = {
+            "promote_option": chosen_option,
+            "promote_to_ghost": chosen_ghost,
+            "cascaded_descendants": [],
+            "rebuild_prompts": [],
+            "archived_branches": []
+        }
 
         if descendants:
             # Import cascade here to avoid circular import (cascade also depends on decision indirectly via cascade.py)
@@ -119,24 +133,28 @@ def decide_resolve(
             # option's ghost, not the decision node itself (which has no git
             # base_sha). Pass the winning option's ghost ref as the explicit
             # rebase base; git rebase resolves the ref to its tip.
-            try:
-                cascade_result = cascade(
-                    feature,
-                    decision_node,
-                    dry_run=False,
-                    lock_obj=lock_obj,
-                    rebase_base_sha=chosen_ghost
-                )
-                if cascade_result.get("error"):
-                    # Mark descendants blocked on cascade error
-                    for desc in descendants:
-                        manifest["nodes"][desc]["status"] = "blocked"
-                    return {
-                        "error": f"Conflict during decision re-parent: {cascade_result.get('error')}",
-                        "action": "Resolve conflicts and retry"
-                    }
-            except Exception as e:
-                raise DecisionError(f"Cascade during decision re-parent failed: {e}")
+            if not dry_run:
+                try:
+                    cascade_result = cascade(
+                        feature,
+                        decision_node,
+                        dry_run=False,
+                        lock_obj=lock_obj,
+                        rebase_base_sha=chosen_ghost
+                    )
+                    if cascade_result.get("error"):
+                        # Mark descendants blocked on cascade error
+                        for desc in descendants:
+                            manifest["nodes"][desc]["status"] = "blocked"
+                        return {
+                            "error": f"Conflict during decision re-parent: {cascade_result.get('error')}",
+                            "action": "Resolve conflicts and retry"
+                        }
+                except Exception as e:
+                    raise DecisionError(f"Cascade during decision re-parent failed: {e}")
+            else:
+                # Dry run: record planned cascade without executing
+                plan_preview["cascaded_descendants"] = descendants
 
         # Step 7: Emit rebuild contract prompts for assuming nodes
         rebuild_prompts = []
@@ -167,27 +185,29 @@ def decide_resolve(
                 }
 
                 rebuild_prompts.append(prompt)
+                plan_preview["rebuild_prompts"].append(prompt)
 
-                # Apply on_flip strategy
-                on_flip = assumption.get("on_flip", "manual")
+                # Apply on_flip strategy (only if not dry_run)
+                if not dry_run:
+                    on_flip = assumption.get("on_flip", "manual")
 
-                if on_flip == "rebuild":
-                    node_obj["status"] = "needs-rework"
-                elif on_flip == "rebase":
-                    # Auto-rebase node onto winning option (safe syntactic change)
-                    try:
-                        subprocess.run(
-                            ["git", "rebase", chosen_ghost, node_obj.get("ghost")],
-                            check=True,
-                            capture_output=True,
-                            timeout=30
-                        )
-                    except subprocess.CalledProcessError as e:
-                        # Rebase conflict; mark blocked
-                        node_obj["status"] = "blocked"
-                        print(f"Warning: Auto-rebase failed for {node_name}: {e}")
-                elif on_flip == "manual":
-                    node_obj["status"] = "needs-rework"
+                    if on_flip == "rebuild":
+                        node_obj["status"] = "needs-rework"
+                    elif on_flip == "rebase":
+                        # Auto-rebase node onto winning option (safe syntactic change)
+                        try:
+                            subprocess.run(
+                                ["git", "rebase", chosen_ghost, node_obj.get("ghost")],
+                                check=True,
+                                capture_output=True,
+                                timeout=30
+                            )
+                        except subprocess.CalledProcessError as e:
+                            # Rebase conflict; mark blocked
+                            node_obj["status"] = "blocked"
+                            print(f"Warning: Auto-rebase failed for {node_name}: {e}")
+                    elif on_flip == "manual":
+                        node_obj["status"] = "needs-rework"
 
         # Step 8: Archive losing options
         archived = []
@@ -195,12 +215,13 @@ def decide_resolve(
             if option_name != chosen_option:
                 losing_ghost = options[option_name].get("ghost")
                 archived.append(option_name)
+                plan_preview["archived_branches"].append(losing_ghost)
 
                 # WARNING: Branch archival operation.
                 # Move losing branch to archive/ namespace for audit trail.
                 # All losing options are archived (never deleted) to preserve history.
 
-                if losing_ghost:
+                if not dry_run and losing_ghost:
                     try:
                         archive_branch = f"archive/{losing_ghost}"
                         subprocess.run(
@@ -212,57 +233,67 @@ def decide_resolve(
                         # Archive failed; log but continue (non-fatal)
                         print(f"Warning: Failed to archive branch {losing_ghost}")
 
-                # Find node for this option and mark archived
-                for n_name, n_obj in manifest.get("nodes", {}).items():
-                    if isinstance(n_obj, dict) and n_obj.get("ghost") == losing_ghost:
-                        n_obj["status"] = "archived"
+                # Find node for this option and mark archived (only if not dry_run)
+                if not dry_run:
+                    for n_name, n_obj in manifest.get("nodes", {}).items():
+                        if isinstance(n_obj, dict) and n_obj.get("ghost") == losing_ghost:
+                            n_obj["status"] = "archived"
 
-        # Step 9: WAL intent (under lock)
-        try:
-            wal_write(
-                feature,
-                "decide-resolve",
-                "intent",
-                {
-                    "feature": feature,
-                    "decision": decision_node,
-                    "chosen": chosen_option,
-                    "archived": archived,
-                    "affected_nodes": [p["node"] for p in rebuild_prompts]
-                },
-                lock_obj=lock_obj
-            )
-        except WALError as e:
-            raise DecisionError(f"Failed to write WAL intent: {e}")
+        # Step 9: WAL intent (under lock) — only if not dry_run
+        if not dry_run:
+            try:
+                wal_write(
+                    feature,
+                    "decide-resolve",
+                    "intent",
+                    {
+                        "feature": feature,
+                        "decision": decision_node,
+                        "chosen": chosen_option,
+                        "archived": archived,
+                        "affected_nodes": [p["node"] for p in rebuild_prompts]
+                    },
+                    lock_obj=lock_obj
+                )
+            except WALError as e:
+                raise DecisionError(f"Failed to write WAL intent: {e}")
 
-        # Step 10: Manifest write (under lock)
-        try:
-            manifest_write_atomic(feature, manifest)
-        except ManifestError as e:
-            raise DecisionError(f"Failed to write manifest: {e}")
+            # Step 10: Manifest write (under lock)
+            try:
+                manifest_write_atomic(feature, manifest)
+            except ManifestError as e:
+                raise DecisionError(f"Failed to write manifest: {e}")
 
-        # Step 11: WAL commit (under lock)
-        try:
-            wal_write(
-                feature,
-                "decide-resolve",
-                "commit",
-                {
-                    "feature": feature,
-                    "decision": decision_node,
-                    "status": "success"
-                },
-                lock_obj=lock_obj
-            )
-        except WALError as e:
-            raise DecisionError(f"Failed to write WAL commit: {e}")
+            # Step 11: WAL commit (under lock)
+            try:
+                wal_write(
+                    feature,
+                    "decide-resolve",
+                    "commit",
+                    {
+                        "feature": feature,
+                        "decision": decision_node,
+                        "status": "success"
+                    },
+                    lock_obj=lock_obj
+                )
+            except WALError as e:
+                raise DecisionError(f"Failed to write WAL commit: {e}")
 
-        return {
-            "status": "resolved",
-            "promoted": chosen_option,
-            "archived": archived,
-            "rebuild_prompts": rebuild_prompts
-        }
+            return {
+                "status": "resolved",
+                "promoted": chosen_option,
+                "archived": archived,
+                "rebuild_prompts": rebuild_prompts
+            }
+        else:
+            # Dry run: return plan preview
+            return {
+                "status": "plan_preview",
+                "promoted": chosen_option,
+                "archived": archived,
+                "plan_preview": plan_preview
+            }
 
     finally:
         release_lock(lock_obj)

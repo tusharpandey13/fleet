@@ -183,13 +183,14 @@ def mock_fleet_home(tmp_path, monkeypatch):
     fleet_dir = tmp_path / ".fleet"
     fleet_dir.mkdir()
 
-    # Monkeypatch os.path.expanduser to return our temp path
+    # Monkeypatch os.path.expanduser so "~/.fleet/<rest>" maps to fleet_dir/<rest>.
+    # Note: fleet_dir already IS the ".fleet" dir, so strip the leading "~/.fleet".
     original_expanduser = os.path.expanduser
 
     def mock_expanduser(path: str) -> str:
-        if path.startswith("~/.fleet"):
-            rel_path = path[len("~/"):]
-            return str(fleet_dir / rel_path)
+        if path == "~/.fleet" or path.startswith("~/.fleet/"):
+            rel_path = path[len("~/.fleet"):].lstrip("/")
+            return str(fleet_dir / rel_path) if rel_path else str(fleet_dir)
         return original_expanduser(path)
 
     monkeypatch.setattr("os.path.expanduser", mock_expanduser)
