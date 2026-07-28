@@ -220,6 +220,7 @@ class TestHandleLeaseFail:
         with patch('fleet_merge.manifest_read', return_value=manifest), \
              patch('fleet_merge.subprocess.run',
                    return_value=MagicMock(returncode=0, stdout='')), \
+             patch('fleet_merge.sys.stdin.isatty', return_value=True), \
              patch('builtins.input', return_value='c'):
             result = handle_lease_fail('pay', 'a1')
 
@@ -232,6 +233,7 @@ class TestHandleLeaseFail:
         with patch('fleet_merge.manifest_read', return_value=manifest), \
              patch('fleet_merge.subprocess.run',
                    return_value=MagicMock(returncode=0, stdout='')), \
+             patch('fleet_merge.sys.stdin.isatty', return_value=True), \
              patch('builtins.input', side_effect=['b', 'no']):
             result = handle_lease_fail('pay', 'a1')
 

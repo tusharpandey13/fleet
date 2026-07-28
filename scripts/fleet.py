@@ -77,6 +77,10 @@ Examples:
     add_feature_arg(materialize_parser)
     materialize_parser.add_argument("--dry-run", action="store_true", help="Preview only")
     materialize_parser.add_argument("--json", action="store_true", help="Output as JSON")
+    materialize_parser.add_argument(
+        "--wal-action", choices=["replay", "rollback", "ignore"],
+        help="WAL recovery action (bypass prompt in non-interactive)"
+    )
 
     # work: Allocate worktree for a node (Unit 2.1)
     work_parser = subparsers.add_parser("work", help="Allocate worktree for a node")
@@ -91,12 +95,20 @@ Examples:
     resolve_parser.add_argument("--option", "-o", required=True, help="Option to promote")
     resolve_parser.add_argument("--dry-run", action="store_true", help="Preview only")
     resolve_parser.add_argument("--json", action="store_true", help="Output as JSON")
+    resolve_parser.add_argument(
+        "--wal-action", choices=["replay", "rollback", "ignore"],
+        help="WAL recovery action (bypass prompt in non-interactive)"
+    )
 
     # refresh: Refresh artifact staleness (Unit 2.3)
     refresh_parser = subparsers.add_parser("refresh", help="Refresh artifact by running hook")
     add_feature_arg(refresh_parser)
     refresh_parser.add_argument("--artifact", "-a", required=True, help="Artifact node name")
     refresh_parser.add_argument("--json", action="store_true", help="Output as JSON")
+    refresh_parser.add_argument(
+        "--wal-action", choices=["replay", "rollback", "ignore"],
+        help="WAL recovery action (bypass prompt in non-interactive)"
+    )
 
     # status: Show feature DAG and node states
     status_parser = subparsers.add_parser("status", help="Show feature status and DAG")
@@ -108,6 +120,10 @@ Examples:
     add_feature_arg(cascade_parser)
     cascade_parser.add_argument("--node", "-n", required=True, help="Root node name")
     cascade_parser.add_argument("--dry-run", action="store_true", help="Preview only")
+    cascade_parser.add_argument(
+        "--wal-action", choices=["replay", "rollback", "ignore"],
+        help="WAL recovery action (bypass prompt in non-interactive)"
+    )
 
     # merge: Merge-back via --onto
     merge_parser = subparsers.add_parser("merge", help="Merge-back (squash cleanup)")
@@ -118,12 +134,28 @@ Examples:
         help="Merge mode (default: individual)"
     )
     merge_parser.add_argument("--dry-run", action="store_true", help="Preview only")
+    merge_parser.add_argument(
+        "--wal-action", choices=["replay", "rollback", "ignore"],
+        help="WAL recovery action (bypass prompt in non-interactive)"
+    )
+    merge_parser.add_argument(
+        "--lease-action", choices=["incorporate", "discard", "manual"],
+        help="Lease conflict action (bypass prompt in non-interactive)"
+    )
 
     # publish: Generate presentation + push PR
     publish_parser = subparsers.add_parser("publish", help="Publish presentation branch")
     add_feature_arg(publish_parser)
     publish_parser.add_argument("--node", "-n", required=True, help="Node to publish")
     publish_parser.add_argument("--dry-run", action="store_true", help="Preview only")
+    publish_parser.add_argument(
+        "--wal-action", choices=["replay", "rollback", "ignore"],
+        help="WAL recovery action (bypass prompt in non-interactive)"
+    )
+    publish_parser.add_argument(
+        "--lease-action", choices=["incorporate", "discard", "manual"],
+        help="Lease conflict action (bypass prompt in non-interactive)"
+    )
 
     # reconcile: Reconcile state from git
     recon_parser = subparsers.add_parser("reconcile", help="Reconcile manifest with git")
@@ -156,20 +188,38 @@ Examples:
                 for orphan in orphans:
                     print(f"  - {orphan.get('op_type')} at {orphan.get('timestamp')}")
 
-                choice = input("Action: (r)eplay, (b)ackup-rollback, (i)gnore? ").strip().lower()
-                if choice == "r":
+                # Determine action: explicit flag, TTY prompt, or safe default
+                choice = None
+                if hasattr(args, "wal_action") and args.wal_action:
+                    choice = args.wal_action
+                elif sys.stdin.isatty():
+                    choice = input("Action: (r)eplay, (b)ackup-rollback, (i)gnore? ").strip().lower()
+                    if choice == "r":
+                        choice = "replay"
+                    elif choice == "b":
+                        choice = "rollback"
+                    elif choice == "i":
+                        choice = "ignore"
+                    else:
+                        choice = "ignore"  # Default to ignore on invalid input
+                else:
+                    # Non-interactive mode: default to safe no-op
+                    choice = "ignore"
+                    print("FLEET_WLR: Orphaned intents found; rerun with --wal-action=replay|rollback|ignore to proceed")
+
+                if choice == "replay":
                     for orphan in orphans:
                         try:
                             wal_replay(feature, orphan, "replay")
                         except WALError as e:
                             print(f"Failed to replay {orphan.get('op_type')}: {e}")
-                elif choice == "b":
+                elif choice == "rollback":
                     for orphan in orphans:
                         try:
                             wal_replay(feature, orphan, "rollback")
                         except WALError as e:
                             print(f"Failed to rollback {orphan.get('op_type')}: {e}")
-                # else choice == "i": continue without action
+                # else choice == "ignore": continue without action
         except Exception:
             # Silent skip if WAL read fails (not fatal; continue with operation)
             pass
@@ -765,7 +815,9 @@ def cmd_merge(args) -> int:
         return 0
 
     try:
-        result = merge_back(feature, node, merge_mode=mode)
+        lease_action = getattr(args, "lease_action", None)
+        wal_action = getattr(args, "wal_action", None)
+        result = merge_back(feature, node, merge_mode=mode, lease_action=lease_action)
         print(f"✓ Merge complete")
         print(json.dumps(result, indent=2))
         return 0
@@ -812,7 +864,8 @@ def cmd_publish(args) -> int:
         # BUG-13 fix: dispatch lease-fail recovery (not generic exception)
         print(f"⚠ Force-push lease rejected (remote changed)")
         try:
-            result = handle_lease_fail(feature, node)
+            lease_action = getattr(args, "lease_action", None)
+            result = handle_lease_fail(feature, node, lease_action)
             status = result.get("status")
             if status == "resolved":
                 print(f"✓ {result.get('message')}")

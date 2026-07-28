@@ -9,6 +9,7 @@ Wraps entire operation in lock + WAL intent/commit for crash recovery.
 """
 
 import os
+import sys
 import subprocess
 from typing import Dict, List, Optional, IO, Tuple
 from fleet_manifest import manifest_read, manifest_write_atomic, ManifestError
@@ -37,7 +38,8 @@ class LeaseFailError(MergeError):
 def merge_back(
     feature: str,
     node: str,
-    merge_mode: str = "individual"
+    merge_mode: str = "individual",
+    lease_action: Optional[str] = None
 ) -> Dict:
     """
     Merge-back (squash cleanup via --onto).
@@ -49,6 +51,7 @@ def merge_back(
         feature: Feature name
         node: Node name to merge-back
         merge_mode: "individual" (enforce order) or "batch" (merge all)
+        lease_action: Optional action for lease conflicts ("incorporate", "discard", "manual")
 
     Returns:
         Dict with {status, node, action, error?}
@@ -95,7 +98,7 @@ def merge_back(
             _push_presentation(manifest, node)
         except LeaseFailError:
             # Lease failed; prompt user (incorporate/discard/manual)
-            return handle_lease_fail(feature, node)
+            return handle_lease_fail(feature, node, lease_action)
 
     # Step 4b: Preflight worktree guard (BUG-16/FR-V2-8)
     # Before lock acquire, mirror cascade's preflight: find parked worktrees for
@@ -391,7 +394,7 @@ def merge_back(
         release_lock(lock_obj)
 
 
-def handle_lease_fail(feature: str, node: str) -> Dict:
+def handle_lease_fail(feature: str, node: str, lease_action: Optional[str] = None) -> Dict:
     """
     Handle force-push lease failure (reviewer pushed to PR).
 
@@ -402,6 +405,8 @@ def handle_lease_fail(feature: str, node: str) -> Dict:
     Args:
         feature: Feature name
         node: Node name with presentation
+        lease_action: Optional action to bypass prompt ("incorporate", "discard", "manual").
+                      If not provided and stdin is not a TTY, defaults to "manual" (safe).
 
     Returns:
         Dict with {status, action, error?}
@@ -447,7 +452,7 @@ def handle_lease_fail(feature: str, node: str) -> Dict:
     except Exception:
         reviewer_commits = "(unable to compute)"
 
-    # Prompt user
+    # Prompt user (or use provided action, with TTY/non-TTY fallback)
     print(f"Reviewer pushed commits to {present_branch}:")
     if reviewer_commits:
         print(reviewer_commits)
@@ -456,7 +461,21 @@ def handle_lease_fail(feature: str, node: str) -> Dict:
     print("  (b) discard (force-push)")
     print("  (c) manual (user resolves)")
 
-    choice = input("Choice (a/b/c): ").strip().lower()
+    # Determine action: explicit flag, TTY prompt, or safe default
+    choice = None
+    if lease_action:
+        if lease_action == "incorporate":
+            choice = "a"
+        elif lease_action == "discard":
+            choice = "b"
+        elif lease_action == "manual":
+            choice = "c"
+    elif sys.stdin.isatty():
+        choice = input("Choice (a/b/c): ").strip().lower()
+    else:
+        # Non-interactive mode: default to safe no-op (manual)
+        choice = "c"
+        print("FLEET_LRF: Lease conflict found; rerun with --lease-action=incorporate|discard|manual to proceed")
 
     if choice == "a":
         # Merge reviewer commits into ghost
@@ -511,7 +530,19 @@ def handle_lease_fail(feature: str, node: str) -> Dict:
     elif choice == "b":
         # Force-push (clobber)
         print("WARNING: Force-push will discard reviewer work.")
-        confirm = input("Are you sure? (yes/no): ").strip().lower()
+
+        # Determine confirmation: check TTY, require explicit opt-in in non-interactive
+        confirm = None
+        if lease_action == "discard":
+            # Explicit opt-in via flag
+            confirm = "yes"
+        elif sys.stdin.isatty():
+            confirm = input("Are you sure? (yes/no): ").strip().lower()
+        else:
+            # Non-interactive mode: require explicit flag
+            confirm = "no"
+            print("FLEET_LFP: Force-push requires explicit --lease-action=discard flag in non-interactive mode")
+
         if confirm != "yes":
             return {"status": "cancelled", "action": "user cancelled"}
 
