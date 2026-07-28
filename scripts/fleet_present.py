@@ -257,6 +257,7 @@ def present_gen(
                 ["git", "push", "--force-with-lease", "origin", f"{present_branch}:{present_branch}"],
                 check=True,
                 capture_output=True,
+                text=True,
                 timeout=30
             )
         except subprocess.CalledProcessError as e:
